@@ -113,7 +113,7 @@ Use `.context("static message")` for cheap, pre-known messages. Use `.with_conte
 
 ## One-off Errors with `anyhow!` and `bail!`
 
-Not every error case deserves its own type. For ad-hoc errors within application logic, the `anyhow!` macro constructs an `anyhow::Error` from a format string:
+Not every error case deserves its own type. For ad-hoc errors within application logic, the `anyhow!` macro constructs an `anyhow::Error` from a literal string, a format string, or an existing error value:
 
 ```rust
 use anyhow::{anyhow, Result};
@@ -127,6 +127,17 @@ fn lookup(key: &str) -> Result<Value> {
     }
     // ...
     # Ok(Value)
+}
+```
+
+When `anyhow!` is passed a single value that implements `std::error::Error`, the original error's `.source()` chain is preserved in the resulting `anyhow::Error`. This means downcasting and chain iteration will still reach the underlying causes:
+
+```rust
+use anyhow::{anyhow, Result};
+
+fn wrap_existing(err: impl std::error::Error + Send + Sync + 'static) -> anyhow::Error {
+    // The source() chain of `err` is preserved in the returned anyhow::Error.
+    anyhow!(err)
 }
 ```
 
@@ -181,6 +192,18 @@ fn process_batch(items: &[Item]) -> Result<Report> {
 }
 ```
 
+When called with only a condition and no message, `ensure!` automatically generates the message `"Condition failed: \`cond\`"` where `cond` is the stringified condition expression:
+
+```rust
+use anyhow::{ensure, Result};
+
+fn check_alignment(offset: usize) -> Result<()> {
+    ensure!(offset % 8 == 0);
+    // Returns: Err("Condition failed: `offset % 8 == 0`") if condition is false
+    Ok(())
+}
+```
+
 Like `bail!`, `ensure!` also accepts a typed error value as its second argument:
 
 ```rust
@@ -217,10 +240,10 @@ use anyhow::{Context, Result};
 
 fn main() {
     if let Err(err) = try_main() {
-        eprintln!("error: {}", err);
+        eprintln!("ERROR: {}", err);
         err.chain()
             .skip(1)
-            .for_each(|cause| eprintln!("  caused by: {}", cause));
+            .for_each(|cause| eprintln!("because: {}", cause));
         std::process::exit(1);
     }
 }
@@ -240,12 +263,12 @@ fn try_main() -> Result<()> {
 Running this when the file is missing produces:
 
 ```console
-error: Failed to read input file at ./data/input.json
-  caused by: No such file or directory (os error 2)
+ERROR: Failed to read input file at ./data/input.json
+because: No such file or directory (os error 2)
 ```
 
 <Note>
-`error.chain().skip(1)` skips the outermost error, which you already printed via `{}`. Each subsequent item in the iterator is a cause from further down the chain.
+`error.chain().skip(1)` skips the outermost error, which you already printed with the first `eprintln!`. Each subsequent item in the iterator is a cause from further down the chain.
 </Note>
 
 ## Interop: `Error::from_boxed` and `into_boxed_dyn_error`

@@ -1,5 +1,5 @@
 ---
-title: "Downcasting anyhow Errors to Concrete Types"
+title: "Downcasting anyhow::Error to Concrete Rust Error Types"
 sidebarTitle: "Downcasting"
 description: "Recover the original concrete error type from an anyhow::Error using is, downcast_ref, downcast_mut, downcast by value, and root_cause."
 ---
@@ -151,7 +151,7 @@ fn inspect() {
 
 ## `error.root_cause()` — The Deepest Source
 
-`root_cause()` traverses the entire `source()` chain and returns a reference to the last (innermost) error — the ultimate cause of the failure, with no further `source()` link.
+`root_cause()` traverses the entire `source()` chain and returns a `&(dyn StdError + 'static)` reference to the last (innermost) error — the ultimate cause of the failure, with no further `source()` link.
 
 ```rust
 use anyhow::Error;

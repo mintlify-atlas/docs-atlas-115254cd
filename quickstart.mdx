@@ -1,5 +1,5 @@
 ---
-title: "Get Started with anyhow in Your Rust Project"
+title: "Quickstart: Add anyhow Error Handling to Your Rust App"
 sidebarTitle: "Quickstart"
 description: "Add anyhow to your Rust project, return anyhow::Result from fallible functions, attach context, use helper macros, and wire up fn main in minutes."
 ---
@@ -153,6 +153,18 @@ fn parse_header(data: &[u8]) -> Result<Header> {
     ensure!(data[0] == 0xDE && data[1] == 0xAD, "invalid magic bytes");
     // ...
     Ok(Header::default())
+}
+```
+
+`ensure!` can also be called with **no message argument**. In that case it automatically generates a `"Condition failed: \`...\`"` message containing a stringified representation of the failed condition:
+
+```rust
+use anyhow::{ensure, Result};
+
+fn validate_key(key: &[u8]) -> Result<()> {
+    // Produces: Condition failed: `key.len() == 32`
+    ensure!(key.len() == 32);
+    Ok(())
 }
 ```
 

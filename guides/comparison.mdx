@@ -140,12 +140,16 @@ The most notable difference is pointer size. A `Box<dyn Error>` is a **fat point
 ```rust
 use std::mem::size_of;
 
-// Two words: data pointer + vtable pointer
+// Two words: data pointer + vtable pointer (on a 64-bit target)
 assert_eq!(size_of::<Box<dyn std::error::Error + Send + Sync>>(), 16);
 
-// One word: thin pointer, vtable stored alongside the allocation
+// One word: thin pointer, vtable stored alongside the allocation (on a 64-bit target)
 assert_eq!(size_of::<anyhow::Error>(), 8);
 ```
+
+<Note>
+The exact byte sizes above are for 64-bit targets (where a pointer is 8 bytes). On 32-bit targets the values would be 8 and 4 respectively. The key invariant — that `anyhow::Error` is one word and `Box<dyn Error>` is two words — holds on all platforms.
+</Note>
 
 `anyhow` achieves this by storing the vtable inside the heap allocation rather than in the pointer itself. The resulting `Error` type is `#[repr(transparent)]` over a single raw pointer.
 

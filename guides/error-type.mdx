@@ -1,5 +1,5 @@
 ---
-title: "The anyhow::Error Type Explained"
+title: "anyhow::Error: Thin-Pointer Error Type for Rust Applications"
 sidebarTitle: "Error Type"
 description: "A deep dive into anyhow::Error: its thin-pointer representation, Send+Sync+'static guarantees, display formats, and interop with Box<dyn Error>."
 ---
@@ -49,9 +49,13 @@ let err: Error = Error::new(io_err);
 
 In practice you almost never call `Error::new` directly — the `From` impl makes `?` do it automatically for any compatible error type.
 
+<Note>
+  `Error::new` requires either the `std` feature (enabled by default) or Rust ≥ 1.81, which stabilised `core::error::Error`. In no-std mode on older compilers (Rust &lt; 1.81), `Error::new` is not available — use `Error::msg` or the `anyhow!` macro instead, and apply `.map_err(Error::msg)` when working with non-anyhow error types.
+</Note>
+
 ### `Error::msg` — from any printable message
 
-Use `Error::msg` when you have a message string or a value that implements `Display + Debug` but does not implement `std::error::Error`. It is equivalent to the `anyhow!(...)` macro but useful as a function pointer (e.g., in iterator combinators).
+Use `Error::msg` when you have a message string or a value that implements `Display + Debug + Send + Sync + 'static` but does not implement `std::error::Error`. It is equivalent to the `anyhow!(...)` macro but useful as a function pointer (e.g., in iterator combinators).
 
 ```rust
 use anyhow::{Error, Result};
@@ -86,6 +90,10 @@ fn from_other_library(boxed: Box<dyn StdError + Send + Sync + 'static>) -> Error
 ```
 
 This is a cheap pointer conversion — no additional heap allocation for the error data itself, though a new backtrace is captured if the boxed error does not already provide one.
+
+<Note>
+  `Error::from_boxed` requires the `std` feature (enabled by default) or Rust ≥ 1.81. It is not available in no-std mode on older compilers.
+</Note>
 
 ## Display Representations
 
@@ -235,4 +243,6 @@ assert!(boxed.downcast::<MyError>().is_ok());
 
 <Info>
   The `From<anyhow::Error> for Box<dyn StdError + Send + Sync + 'static>` impl calls `into_boxed_dyn_error` (the cheap path). If you need to recover the original type after the conversion, use `reallocate_into_boxed_dyn_error_without_backtrace` explicitly.
+
+  Both `into_boxed_dyn_error` and `reallocate_into_boxed_dyn_error_without_backtrace` require the `std` feature (enabled by default) or Rust ≥ 1.81. They are not available in no-std mode on older compilers.
 </Info>

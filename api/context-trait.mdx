@@ -1,5 +1,5 @@
 ---
-title: "anyhow::Context — Error Context Extension Trait"
+title: "anyhow::Context — Sealed Error Annotation Trait API"
 sidebarTitle: "Context"
 description: "The sealed Context trait adds context() and with_context() to Result and Option, annotating errors with messages while preserving full downcast access."
 ---
@@ -11,7 +11,7 @@ The `Context` trait is the primary way to annotate errors with human-readable in
 `Context` is a **sealed trait** — it cannot be implemented for types outside of the `anyhow` crate. This guarantees that both method signatures and their downcasting semantics remain stable. The trait is defined in `anyhow::Context` and must be imported before use.
 
 ```rust
-pub trait Context<T, E>: private::Sealed {
+pub trait Context<T, E>: context::private::Sealed {
     fn context<C>(self, context: C) -> Result<T, Error>
     where
         C: Display + Send + Sync + 'static;

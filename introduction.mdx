@@ -1,7 +1,7 @@
 ---
-title: "anyhow: Flexible Error Handling for Rust Apps"
+title: "anyhow: Ergonomic Error Handling for Rust Applications"
 sidebarTitle: "Introduction"
-description: "anyhow provides a single, flexible error type for Rust applications — simplifying error propagation, context attachment, and reporting without boilerplate."
+description: "anyhow provides a single flexible error type for Rust apps, simplifying error propagation, context attachment, and reporting with no boilerplate."
 ---
 
 Rust's type system makes error handling explicit and safe, but propagating errors through application code often demands repetitive boilerplate: defining error enums, implementing `From` conversions, and boxing errors into `Box<dyn Error>`. The `anyhow` crate solves this with a single, ergonomic `anyhow::Error` type that wraps any error implementing `std::error::Error`, works seamlessly with the `?` operator, and automatically captures backtraces — so you spend less time wiring up error plumbing and more time writing application logic.

@@ -1,5 +1,5 @@
 ---
-title: "Attaching Context to Errors in anyhow"
+title: "Adding Context to Errors with anyhow Context Trait"
 sidebarTitle: "Context"
 description: "Learn how to use .context() and .with_context() to add human-readable diagnostic information that stacks into a 'Caused by:' chain."
 ---
@@ -11,7 +11,8 @@ Low-level errors — "No such file or directory", "connection refused", "unexpec
 The `Context` trait is exported from the `anyhow` crate and is implemented for both `Result<T, E>` and `Option<T>`. It is a sealed trait — you cannot implement it yourself — and provides two methods:
 
 ```rust
-pub trait Context<T, E> {
+// Sealed: cannot be implemented outside of anyhow
+pub trait Context<T, E>: context::private::Sealed {
     /// Wrap the error value with additional context (evaluated eagerly).
     fn context<C>(self, context: C) -> Result<T, Error>
     where

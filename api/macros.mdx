@@ -1,5 +1,5 @@
 ---
-title: "anyhow Macros: anyhow!, bail!, and ensure!"
+title: "anyhow!, bail!, and ensure! Macros Reference Guide"
 sidebarTitle: "Macros"
 description: "The anyhow!, bail!, and ensure! macros provide ergonomic error construction and early returns for functions that return anyhow::Result."
 ---
@@ -164,7 +164,7 @@ fn recurse(depth: usize) -> Result<()> {
 
 The `ensure!` macro checks a condition and returns early with an error if it is not satisfied. It is the non-panicking equivalent of `assert!` for functions that return `anyhow::Result`.
 
-```
+```rust
 ensure!(condition, message_or_error)
 ```
 

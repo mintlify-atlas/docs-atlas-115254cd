@@ -1,5 +1,5 @@
 ---
-title: "anyhow::Error — The Core Error Type Reference"
+title: "anyhow::Error — Thin-Pointer Trait Object Error Type"
 sidebarTitle: "Error"
 description: "Complete API reference for anyhow::Error, a thin-pointer trait-object error type with downcasting, context chaining, and optional backtrace capture."
 ---
@@ -194,7 +194,7 @@ pub fn backtrace(&self) -> &Backtrace
 ```
 
 <Note>
-Only available with the `std` feature (enabled by default). On Rust ≥ 1.65 the return type is `&std::backtrace::Backtrace`. On older compilers with the optional `backtrace` feature crate, it returns `&(impl Debug + Display)`.
+Only available with the `std` feature (enabled by default). The return type is `&std::backtrace::Backtrace`. The `backtrace` feature flag listed in older documentation has no effect in anyhow v1.0 — standard-library backtraces are always used on supported compilers (MSRV 1.68).
 </Note>
 
 ```rust
