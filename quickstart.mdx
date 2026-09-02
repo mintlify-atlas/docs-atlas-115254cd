@@ -1,47 +1,219 @@
 ---
-title: "Quickstart"
-description: "Begin with a guide on the fastest path to a successful outcome"
+title: "Get Started with anyhow in Your Rust Project"
+sidebarTitle: "Quickstart"
+description: "Add anyhow to your Rust project, return anyhow::Result from fallible functions, attach context, use helper macros, and wire up fn main in minutes."
 ---
 
-Describe how someone begins using your product. What is the first thing they need to do? Are there any prerequisites?
-
-A quickstart should take someone from zero to using your product. They'll get a quick win and a sense of what they can accomplish.
-
-## Prerequisites
-
-Before you begin, you must have:
-
-- Requirement one (for example, Node.js 18+, a free account, an API key)
-- Requirement two (for example, a compatible device, a compatible browser, a compatible operating system)
-
-## Get started
+Getting from zero to ergonomic error handling with `anyhow` takes only a few steps. This guide walks through adding the dependency, updating your function signatures, attaching human-readable context, using the convenience macros, and returning `anyhow::Result` from `fn main` so the runtime prints a clean error report on failure.
 
 <Steps>
-  <Step title="Install">
-    Describe how to install your product or sign up.
 
-    ```bash
-    npm install your-package
-    ```
-  </Step>
-  <Step title="Configure">
-    Describe any setup or configuration needed before first use.
+### Add anyhow to Cargo.toml
 
-    ```bash
-    your-cli init
-    ```
-  </Step>
-  <Step title="Run it">
-    Show the first thing a user does to see it working.
+Add `anyhow` to the `[dependencies]` section of your `Cargo.toml`. The default configuration enables the `std` feature, which is correct for most projects.
 
-    ```bash
-    your-cli start
-    ```
-  </Step>
-</Steps>
+<CodeGroup>
+
+```toml Standard (recommended)
+[dependencies]
+anyhow = "1.0"
+```
+
+```toml no_std environments
+[dependencies]
+anyhow = { version = "1.0", default-features = false }
+```
+
+</CodeGroup>
+
+<Note>
+The `no_std` variant requires a global allocator (e.g. the `alloc` crate). Nearly the full API is available in both modes — see the [Introduction](/introduction#no_std-support) for caveats on older toolchains.
+</Note>
+
+After saving, run `cargo build` once to fetch the crate. No other setup is needed.
+
+### Return `anyhow::Result<T>` from fallible functions
+
+Replace any `Result<T, Box<dyn Error>>` or custom error return types in your application functions with `anyhow::Result<T>` (which is an alias for `Result<T, anyhow::Error>`). The `?` operator then automatically converts any error that implements `std::error::Error` into an `anyhow::Error` — no `From` impls or wrapper types required.
+
+```rust
+use anyhow::Result;
+
+fn get_cluster_info() -> Result<ClusterMap> {
+    // std::io::Error is automatically converted via ?
+    let config = std::fs::read_to_string("cluster.json")?;
+
+    // serde_json::Error is automatically converted via ?
+    let map: ClusterMap = serde_json::from_str(&config)?;
+
+    Ok(map)
+}
+```
+
+Any function that returns `anyhow::Result<T>` can freely mix errors from different crates — `std::io::Error`, `serde_json::Error`, database errors, and so on — all propagated through the same `?` without any glue code.
+
+### Attach context with `.context()` and `.with_context()`
+
+Low-level errors like `"No such file or directory (os error 2)"` are difficult to debug without knowing what the application was trying to do. The `Context` trait adds a human-readable message that wraps the underlying error, building a "Caused by:" chain.
+
+```rust
+use anyhow::{Context, Result};
+use std::path::Path;
+
+fn load_instructions(path: &Path) -> Result<Vec<u8>> {
+    // Static context — evaluated eagerly, no allocation on success path
+    let content = std::fs::read(path)
+        .with_context(|| format!("Failed to read instrs from {}", path.display()))?;
+
+    Ok(content)
+}
+
+fn run(path: &Path) -> Result<()> {
+    // String literal context — zero allocation, can downcast to &'static str
+    load_instructions(path).context("Failed to initialise instruction set")?;
+    Ok(())
+}
+```
+
+Use `.context("static message")` when the message is a string literal (zero allocation). Use `.with_context(|| format!(...))` when the message must include runtime values — the closure is only called if an error actually occurs, so there is no overhead on the happy path.
+
+When an error with context is printed (e.g. returned from `fn main`), the output looks like this:
+
+```console
+Error: Failed to initialise instruction set
+
+Caused by:
+    0: Failed to read instrs from ./path/to/instrs.json
+    1: No such file or directory (os error 2)
+```
 
 <Tip>
-  Give people a way to get help. This could be a link to a support page, a chat with a customer support agent, or a forum for your product.
-
-  Example: Need help? Reach out to us at [support@yourcompany.com](mailto:support@yourcompany.com).
+After attaching context with `.context(C)`, the resulting `anyhow::Error` can be downcast to **either** `C` (the context type) **or** the original error type `E`. Existing downcasts continue to work even after you add new context layers.
 </Tip>
+
+### Use `anyhow!`, `bail!`, and `ensure!` macros
+
+`anyhow` ships three macros for constructing and returning errors inline, without needing to define extra types.
+
+**`anyhow!`** — construct an `anyhow::Error` from a format string or any value implementing `Debug + Display`:
+
+```rust
+use anyhow::{anyhow, Result};
+
+fn lookup(key: &str) -> Result<String> {
+    if key.len() != 16 {
+        return Err(anyhow!("key length must be 16 characters, got {:?}", key));
+    }
+    // ...
+    Ok(String::new())
+}
+```
+
+**`bail!`** — shorthand for `return Err(anyhow!(...))`. Use it anywhere you want to exit early with an error message:
+
+```rust
+use anyhow::{bail, Result};
+
+fn check_permission(user: u32, resource: u32) -> Result<()> {
+    if !has_permission(user, resource) {
+        bail!("permission denied for accessing {}", resource);
+    }
+    Ok(())
+}
+```
+
+`bail!` also accepts an existing error value (anything implementing `Debug + Display`), so you can pass a `thiserror`-derived enum variant directly:
+
+```rust
+use anyhow::{bail, Result};
+use thiserror::Error;
+
+#[derive(Error, Debug)]
+enum ScienceError {
+    #[error("recursion limit exceeded")]
+    RecursionLimitExceeded,
+}
+
+fn recurse(depth: usize) -> Result<()> {
+    const MAX_DEPTH: usize = 128;
+    if depth > MAX_DEPTH {
+        bail!(ScienceError::RecursionLimitExceeded);
+    }
+    Ok(())
+}
+```
+
+**`ensure!`** — like `assert!`, but returns an `Err` instead of panicking. It is equivalent to `if !condition { bail!(...) }`:
+
+```rust
+use anyhow::{ensure, Result};
+
+fn parse_header(data: &[u8]) -> Result<Header> {
+    ensure!(data.len() >= 8, "header too short: {} bytes", data.len());
+    ensure!(data[0] == 0xDE && data[1] == 0xAD, "invalid magic bytes");
+    // ...
+    Ok(Header::default())
+}
+```
+
+### Wire up `fn main() -> anyhow::Result<()>`
+
+`anyhow::Result<()>` is a valid return type for `fn main`. When the function returns `Err(e)`, Rust's runtime calls the `Debug` formatter on the error, which prints the full cause chain — and a stack backtrace if one is available.
+
+```rust
+use anyhow::{Context, Result};
+use std::path::PathBuf;
+
+fn main() -> Result<()> {
+    let path = PathBuf::from("cluster.json");
+
+    let config = std::fs::read_to_string(&path)
+        .with_context(|| format!("Failed to read config from {}", path.display()))?;
+
+    let map: serde_json::Value = serde_json::from_str(&config)
+        .context("Failed to parse cluster config as JSON")?;
+
+    println!("Loaded cluster: {:#}", map);
+    Ok(())
+}
+```
+
+If `cluster.json` does not exist, the program exits with:
+
+```console
+Error: Failed to read config from cluster.json
+
+Caused by:
+    No such file or directory (os error 2)
+```
+
+<Tip>
+Set `RUST_BACKTRACE=1` in your environment to include a full stack backtrace in the error output — useful when debugging where in the call stack an error originated:
+
+```bash
+RUST_BACKTRACE=1 cargo run
+```
+
+If you only want backtraces for errors (not panics), use `RUST_LIB_BACKTRACE=1` instead. Backtrace capture requires Rust ≥ 1.65.
+</Tip>
+
+</Steps>
+
+## Next Steps
+
+You now have `anyhow` integrated and working end-to-end. Explore the deeper features to get the most out of it:
+
+<CardGroup cols={2}>
+  <Card title="The Error Type" icon="shield" href="/guides/error-type">
+    Learn about `anyhow::Error`'s display representations, the `Chain` iterator, and how to render cause chains in custom output formats.
+  </Card>
+  <Card title="Context & Cause Chains" icon="layers" href="/guides/context">
+    Dive into the `Context` trait, how context interacts with downcasting, and patterns for adding machine-readable context.
+  </Card>
+  <Card title="Downcasting" icon="arrow-down" href="/guides/downcasting">
+    Recover concrete error types from an `anyhow::Error` with `downcast_ref`, `downcast_mut`, and `downcast` by value.
+  </Card>
+  <Card title="Backtraces" icon="list" href="/guides/backtraces">
+    Understand how and when backtraces are captured, the relevant environment variables, and how to access the backtrace programmatically.
+  </Card>
+</CardGroup>

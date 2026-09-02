@@ -1,0 +1,101 @@
+{
+  "projectType": "sdk-library",
+  "projectName": "anyhow",
+  "projectDescription": "A Rust library providing a flexible, trait-object-based `Error` type for easy idiomatic error handling in applications.",
+  "theme": "luma",
+  "primaryColor": "#428bca",
+  "lightColor": "#241c1c",
+  "darkColor": null,
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Getting Started",
+            "pages": [
+              "introduction",
+              "quickstart"
+            ]
+          },
+          {
+            "group": "Core Concepts",
+            "pages": [
+              "guides/error-type",
+              "guides/context",
+              "guides/downcasting",
+              "guides/backtraces"
+            ]
+          },
+          {
+            "group": "Guides",
+            "pages": [
+              "guides/application-errors",
+              "guides/no-std",
+              "guides/comparison"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "API Reference",
+        "groups": [
+          {
+            "group": "Types",
+            "pages": [
+              "api/error",
+              "api/result",
+              "api/chain"
+            ]
+          },
+          {
+            "group": "Traits",
+            "pages": [
+              "api/context-trait"
+            ]
+          },
+          {
+            "group": "Macros",
+            "pages": [
+              "api/macros"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "Flexible trait-object Error type that works with any std::error::Error implementor",
+    "Context attachment via .context() and .with_context() on Result and Option",
+    "Automatic backtrace capture (Rust >= 1.65) with configurable environment variables",
+    "Downcasting support by value, shared reference, and mutable reference",
+    "Thin-pointer representation — one word in size instead of two like Box<dyn Error>",
+    "anyhow!, bail!, and ensure! macros for ergonomic error construction",
+    "Full no_std support with a global allocator",
+    "Chain iterator for traversing the full error cause chain"
+  ],
+  "publicApiSurface": [
+    "struct Error",
+    "type Result<T, E = Error>",
+    "trait Context<T, E>",
+    "struct Chain<'a>",
+    "fn Ok<T>(value: T) -> Result<T>",
+    "Error::new(error: E) -> Self",
+    "Error::msg(message: M) -> Self",
+    "Error::from_boxed(boxed_error: Box<dyn StdError + Send + Sync>) -> Self",
+    "Error::context(self, context: C) -> Self",
+    "Error::backtrace(&self) -> &Backtrace",
+    "Error::chain(&self) -> Chain",
+    "Error::root_cause(&self) -> &dyn StdError",
+    "Error::is<E>(&self) -> bool",
+    "Error::downcast<E>(self) -> Result<E, Self>",
+    "Error::downcast_ref<E>(&self) -> Option<&E>",
+    "Error::downcast_mut<E>(&mut self) -> Option<&mut E>",
+    "Error::into_boxed_dyn_error(self) -> Box<dyn StdError + Send + Sync>",
+    "Error::reallocate_into_boxed_dyn_error_without_backtrace(self) -> Box<dyn StdError + Send + Sync>",
+    "macro anyhow!",
+    "macro bail!",
+    "macro ensure!",
+    "macro format_err! (alias for anyhow!)"
+  ]
+}

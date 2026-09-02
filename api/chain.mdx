@@ -1,0 +1,244 @@
+---
+title: "anyhow::Chain — Iterating the Error Cause Chain"
+sidebarTitle: "Chain"
+description: "Reference for anyhow::Chain, the DoubleEndedIterator over source errors from Error::chain(), with cause search, custom reporters, and root-cause access."
+---
+
+`anyhow::Chain` is an iterator that walks the linked list of source errors inside an `anyhow::Error`, starting at the outermost error and following each `source()` pointer until the chain ends. It is the primary way to inspect every layer of a wrapped error — printing all causes, searching for a specific type, or extracting the root cause without consuming the error.
+
+## Definition
+
+```rust
+#[cfg(any(feature = "std", not(anyhow_no_core_error)))]
+#[derive(Clone)]
+pub struct Chain<'a> {
+    state: ChainState<'a>,
+}
+```
+
+`Chain<'a>` borrows from the `anyhow::Error` it was created from. The lifetime `'a` is the lifetime of that borrow. The struct derives `Clone`, so you can take a snapshot of the iteration position and continue from it independently.
+
+<Note>
+`Chain` is available when the `std` feature is enabled (the default) or when `core::error::Error` is stable (Rust ≥ 1.81 in no_std mode). In older no_std builds without `core::error::Error`, this type is not exported.
+</Note>
+
+---
+
+## Getting a Chain
+
+Call `Error::chain(&self) -> Chain<'_>` on any `anyhow::Error`:
+
+```rust
+use anyhow::Error;
+
+pub fn print_all_causes(error: &Error) {
+    for (i, cause) in error.chain().enumerate() {
+        if i == 0 {
+            eprintln!("ERROR: {}", cause);
+        } else {
+            eprintln!("  cause #{}: {}", i, cause);
+        }
+    }
+}
+```
+
+The first item yielded is the error itself (i.e. `&**error` after deref). Subsequent items are the `source()` of each preceding error.
+
+---
+
+## Iterator Traits
+
+<CardGroup cols={2}>
+  <Card title="Iterator">
+    `Item = &'a (dyn StdError + 'static)`. Advances from outermost to innermost error by following each `source()` link.
+  </Card>
+  <Card title="DoubleEndedIterator">
+    `next_back()` walks from the root cause toward the outermost error. Triggers an internal buffer allocation on first back traversal to enable bidirectional iteration.
+  </Card>
+  <Card title="ExactSizeIterator">
+    `len()` walks the entire remaining chain to count elements. The `size_hint()` method returns exact bounds `(len, Some(len))`.
+  </Card>
+  <Card title="Clone">
+    The derived `Clone` implementation lets you duplicate the iterator at any point in the traversal.
+  </Card>
+</CardGroup>
+
+---
+
+## Common Patterns
+
+### Finding a Specific Error Type
+
+Walk the chain with `downcast_ref` until you find the concrete type you are looking for. This is the canonical way to search through wrapped errors.
+
+```rust
+use anyhow::Error;
+use std::io;
+
+pub fn underlying_io_error_kind(error: &Error) -> Option<io::ErrorKind> {
+    for cause in error.chain() {
+        if let Some(io_error) = cause.downcast_ref::<io::Error>() {
+            return Some(io_error.kind());
+        }
+    }
+    None
+}
+```
+
+---
+
+### Custom Error Reporter
+
+Print each layer of the cause chain with distinct formatting. The first element is the top-level message; subsequent elements are the underlying causes.
+
+```rust
+use anyhow::Result;
+
+fn main() {
+    if let Err(err) = try_main() {
+        eprintln!("ERROR: {}", err);
+        err.chain()
+            .skip(1)
+            .for_each(|cause| eprintln!("because: {}", cause));
+        std::process::exit(1);
+    }
+}
+
+fn try_main() -> Result<()> {
+    // application logic
+    Ok(())
+}
+```
+
+---
+
+### Skipping the Outermost Error with `.skip(1)`
+
+When the top-level message has already been printed (e.g. as a log entry header), use `.skip(1)` to iterate only the underlying causes:
+
+```rust
+use anyhow::Error;
+
+fn log_causes(error: &Error) {
+    // The outermost message is logged separately by the caller
+    for cause in error.chain().skip(1) {
+        log::debug!("  caused by: {}", cause);
+    }
+}
+```
+
+---
+
+### Getting the Root Cause via `.last()`
+
+`Chain` implements `Iterator`, so `.last()` returns the deepest error in the chain — identical to calling `error.root_cause()`:
+
+```rust
+use anyhow::Error;
+
+fn root(error: &Error) -> &(dyn std::error::Error + 'static) {
+    error.chain().last().unwrap()
+    // same as: error.root_cause()
+}
+```
+
+<Tip>
+Prefer `error.root_cause()` in production code — it expresses intent more clearly. Use `.last()` on a `Chain` when you already have the iterator in hand.
+</Tip>
+
+---
+
+### Reverse Iteration with `DoubleEndedIterator`
+
+Iterate from the root cause up to the outermost error using `.rev()`:
+
+```rust
+use anyhow::Error;
+
+fn print_from_root(error: &Error) {
+    println!("Root-first cause chain:");
+    for cause in error.chain().rev() {
+        println!("  {}", cause);
+    }
+}
+```
+
+<Note>
+The first call to `next_back()` (or `.rev()`) triggers an internal `Vec` allocation to buffer all remaining errors so that forward and backward iteration can be mixed safely. This is a one-time cost per reversal.
+</Note>
+
+---
+
+### Counting Layers with `ExactSizeIterator`
+
+```rust
+use anyhow::Error;
+
+fn depth(error: &Error) -> usize {
+    error.chain().len()
+}
+```
+
+`len()` walks the remaining chain, so calling it repeatedly on the same iterator is O(n) each time. If you need the count alongside the iteration, collect into a `Vec` or use `enumerate()`.
+
+---
+
+### Cloning an Iterator Checkpoint
+
+Because `Chain` implements `Clone`, you can save the iteration state at any point:
+
+```rust
+use anyhow::Error;
+
+fn first_two_causes(error: &Error) -> (String, Option<String>) {
+    let mut chain = error.chain();
+    let first = chain.next().map(|e| e.to_string()).unwrap_or_default();
+    let second = chain.next().map(|e| e.to_string());
+    (first, second)
+}
+```
+
+---
+
+## Relationship to `Error::root_cause`
+
+`Error::root_cause` is defined in terms of `Chain`:
+
+```rust
+pub fn root_cause(&self) -> &(dyn StdError + 'static) {
+    self.chain().last().unwrap()
+}
+```
+
+Both return a reference to the same object. `root_cause()` is the ergonomic shorthand; `chain()` is the full interface when you need to inspect intermediate errors.
+
+---
+
+## Feature Requirements
+
+<Tabs>
+  <Tab title="std (default)">
+    `Chain` is exported by default when the `std` feature is active. No additional configuration is needed.
+
+    ```toml
+    [dependencies]
+    anyhow = "1.0"
+    ```
+  </Tab>
+  <Tab title="no_std (Rust ≥ 1.81)">
+    On Rust 1.81 or later, `core::error::Error` is stable and `Chain` is available even without the `std` feature.
+
+    ```toml
+    [dependencies]
+    anyhow = { version = "1.0", default-features = false }
+    ```
+  </Tab>
+  <Tab title="no_std (Rust < 1.81)">
+    On older compilers without `core::error::Error`, the `Chain` type is not available in no_std mode. Use `.map_err(Error::msg)` for error conversion and skip chain inspection.
+
+    ```toml
+    [dependencies]
+    anyhow = { version = "1.0", default-features = false }
+    ```
+  </Tab>
+</Tabs>

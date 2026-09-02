@@ -1,0 +1,233 @@
+---
+title: "Attaching Context to Errors in anyhow"
+sidebarTitle: "Context"
+description: "Learn how to use .context() and .with_context() to add human-readable diagnostic information that stacks into a 'Caused by:' chain."
+---
+
+Low-level errors — "No such file or directory", "connection refused", "unexpected EOF" — are accurate but rarely actionable on their own. Without knowing which file, which connection, or which stream was involved, a developer staring at a log line has to reconstruct the call path from first principles. The `Context` trait solves this by letting you attach a human-readable description at each layer of your call stack, building up a chain that prints as a readable narrative when the error surfaces.
+
+## The `Context` Trait
+
+The `Context` trait is exported from the `anyhow` crate and is implemented for both `Result<T, E>` and `Option<T>`. It is a sealed trait — you cannot implement it yourself — and provides two methods:
+
+```rust
+pub trait Context<T, E> {
+    /// Wrap the error value with additional context (evaluated eagerly).
+    fn context<C>(self, context: C) -> Result<T, Error>
+    where
+        C: Display + Send + Sync + 'static;
+
+    /// Wrap the error value with additional context (evaluated lazily).
+    fn with_context<C, F>(self, f: F) -> Result<T, Error>
+    where
+        C: Display + Send + Sync + 'static,
+        F: FnOnce() -> C;
+}
+```
+
+Import it alongside `Result` at the top of any module that attaches context:
+
+```rust
+use anyhow::{Context, Result};
+```
+
+## `.context()` — Eager Static Context
+
+Pass a value that implements `Display` directly. The context is constructed immediately, whether or not the `Result` or `Option` holds an error.
+
+```rust
+use anyhow::{Context, Result};
+
+fn load_config() -> Result<String> {
+    std::fs::read_to_string("config.toml")
+        .context("Failed to read config.toml")
+}
+```
+
+Use `.context()` with a static string or a value that is cheap to produce. It also works with any type that implements `Display + Send + Sync + 'static`, including your own structured context types (see [Effect on Downcasting](#effect-on-downcasting) below).
+
+## `.with_context()` — Lazy Evaluated Context
+
+Pass a closure that returns the context value. The closure is only called when the `Result` is an `Err` or the `Option` is `None`, making it more efficient when the context message involves heap allocation or formatting.
+
+```rust
+use anyhow::{Context, Result};
+
+fn load_file(path: &std::path::Path) -> Result<Vec<u8>> {
+    std::fs::read(path)
+        .with_context(|| format!("Failed to read file at {}", path.display()))
+}
+```
+
+<Tip>
+  Prefer `.with_context(|| format!(...))` over `.context(format!(...))` whenever the context string involves `format!` or other allocation. The closure avoids doing that work on the happy path.
+</Tip>
+
+## Context on `Option` — Converting `None` to an Error
+
+The `Context` trait is implemented for `Option<T>` as well. Calling `.context()` or `.with_context()` converts `None` into an `Err(anyhow::Error)` containing the provided message, and passes `Some(value)` through unchanged.
+
+```rust
+use anyhow::{Context, Result};
+
+fn get_username(id: u64) -> Result<String> {
+    find_user(id)
+        .context("user not found in the database")?;
+    // ...
+    # Ok(String::new())
+}
+
+fn find_user(id: u64) -> Option<String> {
+    // returns None if user doesn't exist
+    # None
+}
+```
+
+This is particularly useful when working with `HashMap::get`, `Iterator::next`, or other APIs that return `Option`.
+
+```rust
+use anyhow::{Context, Result};
+use std::collections::HashMap;
+
+fn lookup_setting(config: &HashMap<String, String>, key: &str) -> Result<&str> {
+    config
+        .get(key)
+        .map(String::as_str)
+        .with_context(|| format!("missing required config key: {key}"))
+}
+```
+
+## How Context Stacks
+
+Each `.context()` or `.with_context()` call wraps the current error in a new layer. When the error is displayed with the `Debug` formatter (`{:?}`) — for example, when returned from `fn main` — the layers print from outermost (most recent context) to innermost (root cause) under the `Caused by:` heading.
+
+```rust
+use anyhow::{Context, Result};
+use std::path::Path;
+
+pub struct ImportantThing {
+    path: std::path::PathBuf,
+}
+
+impl ImportantThing {
+    pub fn detach(&mut self) -> Result<()> {
+        // ... operation that may fail
+        # Ok(())
+    }
+}
+
+pub fn do_it(mut it: ImportantThing) -> Result<Vec<u8>> {
+    it.detach().context("Failed to detach the important thing")?;
+
+    let path = &it.path;
+    let content = std::fs::read(path)
+        .with_context(|| format!("Failed to read instrs from {}", path.display()))?;
+
+    Ok(content)
+}
+```
+
+When the `std::fs::read` call fails, the output from `fn main` looks like:
+
+```console
+Error: Failed to read instrs from ./path/to/instrs.json
+
+Caused by:
+    No such file or directory (os error 2)
+```
+
+With multiple context layers stacked, each cause is indented under the previous one:
+
+```console
+Error: Failed to complete startup
+
+Caused by:
+    0: Failed to read instrs from ./path/to/instrs.json
+    1: No such file or directory (os error 2)
+```
+
+<Info>
+  You can render the chain yourself if none of the built-in formats suit your needs. `Error::chain()` returns an iterator over every cause from outermost to innermost.
+
+  ```rust
+  if let Err(err) = try_main() {
+      eprintln!("ERROR: {}", err);
+      err.chain().skip(1).for_each(|cause| eprintln!("because: {}", cause));
+      std::process::exit(1);
+  }
+  ```
+</Info>
+
+## Effect on Downcasting
+
+Attaching context does **not** hide the original error type from downcasting. After calling `.context(c)` on an error of type `E`, the resulting `anyhow::Error` can be downcast to **either** `C` **or** `E`. This design supports two complementary patterns:
+
+<Tabs>
+  <Tab title="Context on a typed error">
+    The error type is meaningful for downcasting; the context is human-readable prose. Adding context does not break any existing downcast that worked before.
+
+    ```rust
+    use anyhow::{Context, Result};
+
+    // SuspiciousError implements std::error::Error
+    fn do_it() -> Result<()> {
+        helper().context("Failed to complete the work")?;
+        // ...
+        # Ok(())
+    }
+
+    fn main() {
+        let err = do_it().unwrap_err();
+        // Downcast to SuspiciousError still works despite the context wrapper
+        if let Some(e) = err.downcast_ref::<SuspiciousError>() {
+            // handle it
+        }
+    }
+    # #[derive(Debug)]
+    # struct SuspiciousError;
+    # impl std::fmt::Display for SuspiciousError {
+    #     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result { Ok(()) }
+    # }
+    # impl std::error::Error for SuspiciousError {}
+    # fn helper() -> Result<()> { Err(anyhow::anyhow!(SuspiciousError)) }
+    ```
+  </Tab>
+  <Tab title="Typed context for categorization">
+    The context type itself carries machine-readable information that higher layers downcast to. The lower-level error message is plain text.
+
+    ```rust
+    use anyhow::{Context, Result};
+
+    #[derive(Debug)]
+    struct HelperFailed;
+
+    impl std::fmt::Display for HelperFailed {
+        fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            write!(f, "helper failed")
+        }
+    }
+
+    fn do_it() -> Result<()> {
+        helper().context(HelperFailed)?;
+        // ...
+        # Ok(())
+    }
+
+    fn main() {
+        let err = do_it().unwrap_err();
+        // Downcast to HelperFailed (the context type) succeeds
+        if let Some(_) = err.downcast_ref::<HelperFailed>() {
+            // handle categorized failure
+        }
+    }
+
+    fn helper() -> Result<()> {
+        anyhow::bail!("no such file or directory");
+    }
+    ```
+  </Tab>
+</Tabs>
+
+<Note>
+  Because downcasting searches through the context chain recursively, you can freely add `.context()` calls to existing code without worrying that they will break callers that rely on downcasting to a specific error type.
+</Note>

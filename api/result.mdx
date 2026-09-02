@@ -1,0 +1,231 @@
+---
+title: "anyhow::Result — The Application Result Type"
+sidebarTitle: "Result"
+description: "Reference for the anyhow::Result type alias and anyhow::Ok helper, simplifying fallible function signatures across your entire Rust application."
+---
+
+`anyhow::Result<T>` is a type alias that pins the error type to `anyhow::Error`, so you write `Result<T>` instead of `Result<T, anyhow::Error>` throughout your application. It accepts one **or** two type parameters, so it can also stand in for a specific error type when needed, making it a flexible return type from top-level main functions down to deeply nested helpers.
+
+## Definition
+
+```rust
+pub type Result<T, E = Error> = core::result::Result<T, E>;
+```
+
+The alias simply re-exports `core::result::Result` with the error type defaulted to `anyhow::Error`. When you provide only one type parameter the second defaults to `anyhow::Error`. When you provide two, it behaves identically to the standard library `Result`.
+
+---
+
+## One vs. Two Type Parameters
+
+```rust
+use anyhow::Result;
+
+// One parameter — E defaults to anyhow::Error
+fn demo1() -> Result<String> {
+    // equivalent to: std::result::Result<String, anyhow::Error>
+    Ok(std::fs::read_to_string("config.toml")?)
+}
+
+// Two parameters — behaves like std::result::Result<T, OtherError>
+fn demo2() -> Result<String, std::num::ParseIntError> {
+    // equivalent to: std::result::Result<String, std::num::ParseIntError>
+    Ok("42".parse::<i32>()?.to_string())
+}
+```
+
+<Tip>
+Prefer the one-parameter form `Result<T>` for most application code. Reserve the two-parameter form `Result<T, OtherError>` for API boundaries where callers need to inspect a typed error without converting to `anyhow::Error`.
+</Tip>
+
+---
+
+## Using as a Function Return Type
+
+Any error type that implements `std::error::Error + Send + Sync + 'static` converts automatically into `anyhow::Error` via the `?` operator. You can mix error types freely within the same function body.
+
+```rust
+use anyhow::{Context, Result};
+
+fn get_cluster_info() -> Result<ClusterMap> {
+    let config = std::fs::read_to_string("cluster.json")
+        .context("Failed to read cluster config file")?;
+
+    let map: ClusterMap = serde_json::from_str(&config)
+        .context("Failed to parse cluster config as JSON")?;
+
+    Ok(map)
+}
+```
+
+Both `std::io::Error` (from `read_to_string`) and `serde_json::Error` (from `from_str`) are different concrete types, yet both propagate cleanly with `?` because each implements `std::error::Error + Send + Sync + 'static`.
+
+---
+
+## Using in `fn main`
+
+Returning `anyhow::Result<()>` from `main` causes Rust's runtime to print the `Debug` representation of any error on exit, which includes the full cause chain and backtrace:
+
+```rust
+use anyhow::{Context, Result};
+
+fn main() -> Result<()> {
+    let config = std::fs::read_to_string("cluster.json")
+        .context("Failed to read cluster.json")?;
+
+    let map: ClusterMap = serde_json::from_str(&config)
+        .context("Failed to parse cluster.json")?;
+
+    println!("cluster info: {:#?}", map);
+    Ok(())
+}
+```
+
+When the function returns an error, the output looks like:
+
+```console
+Error: Failed to parse cluster.json
+
+Caused by:
+    expected `:` at line 3 column 7
+```
+
+<Note>
+The backtrace appears below the cause chain when `RUST_BACKTRACE=1` or `RUST_LIB_BACKTRACE=1` is set in the environment.
+</Note>
+
+---
+
+## Custom Error Reporter in `main`
+
+If you prefer complete control over how errors are displayed, return normally from `main` and call a helper:
+
+```rust
+use anyhow::Result;
+
+fn main() {
+    if let Err(err) = try_main() {
+        eprintln!("ERROR: {}", err);
+        err.chain()
+            .skip(1)
+            .for_each(|cause| eprintln!("  caused by: {}", cause));
+        std::process::exit(1);
+    }
+}
+
+fn try_main() -> Result<()> {
+    // application logic here
+    Ok(())
+}
+```
+
+---
+
+## The `anyhow::Ok` Helper
+
+### Definition
+
+```rust
+#[allow(non_snake_case)]
+#[inline]
+pub fn Ok<T>(value: T) -> Result<T> {
+    Result::Ok(value)
+}
+```
+
+### When to Use It
+
+Type inference cannot always deduce the `E` type when you write `Ok(value)` in a position where no other part of the expression pins `E`. The most common situation is a closure or `async` block whose return type is not otherwise constrained:
+
+```rust
+use anyhow::Result;
+
+// This fails — Rust cannot infer E for Result<i32, E>
+// let _: Result<i32> = Ok(1);  // E0282
+
+// These work:
+let _ = anyhow::Ok(1_i32);               // anyhow::Ok infers E = anyhow::Error
+let _ = Ok::<_, anyhow::Error>(1_i32);   // explicit turbofish
+```
+
+A common real-world case is in iterator adaptors that return `Result`:
+
+```rust
+use anyhow::Result;
+
+fn first_positive(numbers: &[i32]) -> Result<Option<i32>> {
+    let found = numbers
+        .iter()
+        .copied()
+        .find(|&n| n > 0);
+
+    anyhow::Ok(found)   // without this helper, the type of Ok cannot be inferred
+}
+```
+
+<Tabs>
+  <Tab title="With anyhow::Ok">
+    ```rust
+    use anyhow::Result;
+
+    fn compute() -> Result<Vec<u32>> {
+        let values = vec![1u32, 2, 3]
+            .into_iter()
+            .map(|x| x * 2)
+            .collect::<Vec<_>>();
+
+        anyhow::Ok(values)
+    }
+    ```
+  </Tab>
+  <Tab title="With Ok::<_, anyhow::Error>">
+    ```rust
+    use anyhow::{Error, Result};
+
+    fn compute() -> Result<Vec<u32>> {
+        let values = vec![1u32, 2, 3]
+            .into_iter()
+            .map(|x| x * 2)
+            .collect::<Vec<_>>();
+
+        Ok::<_, Error>(values)
+    }
+    ```
+  </Tab>
+  <Tab title="With explicit annotation">
+    ```rust
+    use anyhow::Result;
+
+    fn compute() -> Result<Vec<u32>> {
+        let values: Vec<u32> = vec![1u32, 2, 3]
+            .into_iter()
+            .map(|x| x * 2)
+            .collect();
+
+        Ok(values) // type annotation elsewhere resolves inference
+    }
+    ```
+  </Tab>
+</Tabs>
+
+---
+
+## Interoperability With `std::result::Result`
+
+Because `anyhow::Result<T>` is just an alias, code that accepts `std::result::Result<T, anyhow::Error>` and code that accepts `anyhow::Result<T>` are fully interchangeable — they refer to the same type:
+
+```rust
+use anyhow::{Error, Result};
+
+// These two signatures are identical at the type level:
+fn a() -> Result<()> { Ok(()) }
+fn b() -> std::result::Result<(), Error> { Ok(()) }
+
+fn consume_either(r: std::result::Result<(), Error>) {
+    let _ = r;
+}
+
+// Both can be passed without conversion:
+consume_either(a());
+consume_either(b());
+```

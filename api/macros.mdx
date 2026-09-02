@@ -1,0 +1,265 @@
+---
+title: "anyhow Macros: anyhow!, bail!, and ensure!"
+sidebarTitle: "Macros"
+description: "The anyhow!, bail!, and ensure! macros provide ergonomic error construction and early returns for functions that return anyhow::Result."
+---
+
+The `anyhow` crate ships three macros that cover the most common patterns in application error handling: constructing a one-off error value, returning early on failure, and asserting preconditions without panicking. Together they eliminate the boilerplate of spelling out `return Err(anyhow::Error::msg(...))` every time you need to surface an error.
+
+## `anyhow!` — Construct an Error Value
+
+The `anyhow!` macro constructs an [`anyhow::Error`](/api/error) from a string, a format string with interpolated values, or an existing error value. It evaluates to an `Error` — it does not return from the current function.
+
+```rust
+#[macro_export]
+macro_rules! anyhow {
+    ($msg:literal $(,)?) => { ... };
+    ($err:expr $(,)?) => { ... };
+    ($fmt:expr, $($arg:tt)*) => { ... };
+}
+```
+
+### Forms
+
+<Tabs>
+  <Tab title="String literal">
+    A bare string literal creates an error that can be downcast to `&'static str`.
+
+    ```rust
+    use anyhow::anyhow;
+
+    let err = anyhow!("something went wrong");
+    ```
+  </Tab>
+  <Tab title="Format string">
+    A format string with arguments creates an error that can be downcast to `String`.
+
+    ```rust
+    use anyhow::{anyhow, Result};
+
+    fn lookup(key: &str) -> Result<()> {
+        if key.len() != 16 {
+            return Err(anyhow!("key length must be 16 characters, got {:?}", key));
+        }
+        Ok(())
+    }
+    ```
+  </Tab>
+  <Tab title="Existing error value">
+    Passing a value that implements `std::error::Error` preserves its `source()` chain inside the resulting `anyhow::Error`.
+
+    ```rust
+    use anyhow::{anyhow, Result};
+    use std::num::ParseIntError;
+
+    fn parse_port(s: &str) -> Result<u16> {
+        let port: u16 = s.parse().map_err(|e: ParseIntError| anyhow!(e))?;
+        Ok(port)
+    }
+    ```
+
+    Any type that implements only `Debug + Display` (but not necessarily `std::error::Error`) is also accepted — in that case no `source` chain is preserved.
+  </Tab>
+</Tabs>
+
+### `format_err!` alias
+
+`format_err!` is a re-export alias for the `anyhow!` macro, provided for compatibility with code that uses the older `failure` crate naming convention:
+
+```rust
+// Both of these are identical:
+use anyhow::anyhow;
+use anyhow::format_err;
+
+let e1 = anyhow!("disk quota exceeded");
+let e2 = format_err!("disk quota exceeded");
+```
+
+<ParamField path="$msg" type="string literal">
+  A `'static` string literal. The resulting error can be downcast to `&'static str`.
+</ParamField>
+
+<ParamField path="$err" type="expr">
+  An expression evaluating to a type implementing at minimum `Debug + Display`. If the type also implements `std::error::Error`, its `source()` chain is preserved.
+</ParamField>
+
+<ParamField path="$fmt, $($arg)*" type="format string + arguments">
+  A format string and arguments in the same form as `format!`. The resulting error can be downcast to `String`.
+</ParamField>
+
+---
+
+## `bail!` — Return Early with an Error
+
+The `bail!` macro is shorthand for `return Err(anyhow!(...))`. It accepts the same argument forms as `anyhow!` and immediately returns from the enclosing function or closure.
+
+```rust
+#[macro_export]
+macro_rules! bail {
+    ($msg:literal $(,)?) => {
+        return $crate::__private::Err($crate::__anyhow!($msg))
+    };
+    ($err:expr $(,)?) => {
+        return $crate::__private::Err($crate::__anyhow!($err))
+    };
+    ($fmt:expr, $($arg:tt)*) => {
+        return $crate::__private::Err($crate::__anyhow!($fmt, $($arg)*))
+    };
+}
+```
+
+The surrounding function's return type must be `Result<_, anyhow::Error>`.
+
+### Examples
+
+<CodeGroup>
+
+```rust Format string
+use anyhow::{bail, Result};
+
+fn has_permission(user: usize, resource: usize) -> bool {
+    // ...
+    # true
+}
+
+fn access_resource(user: usize, resource: usize) -> Result<()> {
+    if !has_permission(user, resource) {
+        bail!("permission denied for accessing {}", resource);
+    }
+    // continue with authorized logic...
+    Ok(())
+}
+```
+
+```rust Typed error value
+use anyhow::{bail, Result};
+use thiserror::Error;
+
+const MAX_DEPTH: usize = 16;
+
+#[derive(Error, Debug)]
+enum ScienceError {
+    #[error("recursion limit exceeded")]
+    RecursionLimitExceeded,
+}
+
+fn recurse(depth: usize) -> Result<()> {
+    if depth > MAX_DEPTH {
+        bail!(ScienceError::RecursionLimitExceeded);
+    }
+    // ...
+    Ok(())
+}
+```
+
+</CodeGroup>
+
+<Tip>
+  Prefer `bail!` over the explicit `return Err(anyhow!(...))` form — it is shorter, reads naturally alongside `?`, and makes the early-return intent obvious at a glance. Reserve the explicit form for cases where you need to store the error in a variable before returning it.
+</Tip>
+
+---
+
+## `ensure!` — Conditional Early Return
+
+The `ensure!` macro checks a condition and returns early with an error if it is not satisfied. It is the non-panicking equivalent of `assert!` for functions that return `anyhow::Result`.
+
+```
+ensure!(condition, message_or_error)
+```
+
+This expands to:
+
+```rust
+if !condition {
+    return Err(anyhow!(...));
+}
+```
+
+The surrounding function's return type must be `Result<_, anyhow::Error>`.
+
+### Forms
+
+<Tabs>
+  <Tab title="String or format message">
+    ```rust
+    use anyhow::{ensure, Result};
+
+    fn validate_username(name: &str) -> Result<()> {
+        ensure!(!name.is_empty(), "username must not be empty");
+        ensure!(
+            name.len() <= 32,
+            "username too long: {} characters (max 32)",
+            name.len()
+        );
+        Ok(())
+    }
+    ```
+  </Tab>
+  <Tab title="Typed error value">
+    ```rust
+    use anyhow::{ensure, Result};
+    use thiserror::Error;
+
+    const MAX_DEPTH: usize = 16;
+
+    #[derive(Error, Debug)]
+    enum ScienceError {
+        #[error("recursion limit exceeded")]
+        RecursionLimitExceeded,
+    }
+
+    fn process(depth: usize) -> Result<()> {
+        ensure!(depth <= MAX_DEPTH, ScienceError::RecursionLimitExceeded);
+        // ...
+        Ok(())
+    }
+    ```
+  </Tab>
+  <Tab title="Condition only">
+    When called with only a condition and no message, `ensure!` generates a descriptive message from the source code of the condition itself:
+
+    ```rust
+    use anyhow::{ensure, Result};
+
+    fn check_bounds(index: usize, len: usize) -> Result<()> {
+        ensure!(index < len);
+        // If index == 5 and len == 3, the error message will be:
+        // "Condition failed: `index < len`"
+        Ok(())
+    }
+    ```
+  </Tab>
+</Tabs>
+
+<ParamField path="$cond" type="bool expression">
+  The condition to test. If it evaluates to `false`, the macro executes the early return. The macro accepts any boolean expression, including chained comparisons.
+</ParamField>
+
+<ParamField path="message_or_error" type="string literal | format string | expr">
+  Optional. The error to return when the condition fails. Accepts the same forms as `anyhow!`: a string literal, a format string with arguments, or an existing error value. If omitted, a message is generated from the stringified condition.
+</ParamField>
+
+<Note>
+  `ensure!` has special handling for **chained comparison expressions** such as `a < b && b < c` or `x == y`. When such conditions fail, anyhow generates a diagnostic message that includes the runtime values of both sides of the comparison — similar to the output you'd see from `assert_eq!`. This makes `ensure!` particularly useful for validating numeric bounds and invariants where knowing the actual values is essential for debugging.
+</Note>
+
+---
+
+## Quick Comparison
+
+<CardGroup cols={3}>
+  <Card title="anyhow!" icon="circle-exclamation">
+    Constructs an `anyhow::Error` value. Does **not** return from the function. Use when you need to build an error and store or transform it before propagating.
+  </Card>
+  <Card title="bail!" icon="arrow-turn-down-left">
+    Immediately returns `Err(anyhow!(...))` from the current function. Use for early exits on invalid state or unrecoverable conditions inside business logic.
+  </Card>
+  <Card title="ensure!" icon="shield-check">
+    Checks a condition; if false, returns `Err(anyhow!(...))`. Use to validate preconditions and invariants at the top of a function, replacing manual `if !cond { bail!(...) }` patterns.
+  </Card>
+</CardGroup>
+
+<Tip>
+  All three macros accept the same argument forms: a string literal, a format string with arguments, or an existing error value. If you know how to use one, you know how to use all three.
+</Tip>

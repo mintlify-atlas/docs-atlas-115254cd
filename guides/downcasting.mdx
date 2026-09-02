@@ -1,0 +1,240 @@
+---
+title: "Downcasting anyhow Errors to Concrete Types"
+sidebarTitle: "Downcasting"
+description: "Recover the original concrete error type from an anyhow::Error using is, downcast_ref, downcast_mut, downcast by value, and root_cause."
+---
+
+`anyhow::Error` erases the concrete error type behind a trait object, which is exactly what you want when propagating errors through many layers of application code. Sometimes, however, the top of the call stack — a CLI handler, an HTTP request handler, a test assertion — needs to inspect the specific kind of error that occurred and take a different action depending on it. Downcasting lets you recover the original type without having to thread type parameters through every intermediate function.
+
+## When You Need Downcasting
+
+Downcasting is the right tool when:
+
+- You want to pattern-match on a custom error variant to decide between retry, fallback, or fatal behaviour.
+- A test needs to assert that a specific error type was produced.
+- A high-level handler wants to translate one error type into a different response format.
+- You are using `anyhow` alongside domain error enums defined with `thiserror`.
+
+If your code never inspects the inner type — it only logs, formats, or propagates the error — you do not need to downcast at all.
+
+## `error.is::<E>()` — Type Check
+
+Returns `true` if the error holds a value of type `E`. This is a lightweight boolean check; it does not borrow or move the value.
+
+```rust
+use anyhow::Error;
+
+fn handle(err: &Error) {
+    if err.is::<std::io::Error>() {
+        eprintln!("an I/O error occurred");
+    }
+}
+```
+
+`E` must satisfy `Display + Debug + Send + Sync + 'static`. Under the hood, `is` is implemented as `self.downcast_ref::<E>().is_some()`.
+
+## `error.downcast_ref::<E>()` — Borrow as `&E`
+
+Returns `Some(&E)` if the underlying error is of type `E`, or `None` otherwise. The error is not consumed; you borrow it for as long as the reference lives.
+
+```rust
+use anyhow::anyhow;
+use std::task::Poll;
+
+#[derive(Debug)]
+enum DataStoreError {
+    Censored(()),
+}
+
+impl std::fmt::Display for DataStoreError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "data store error")
+    }
+}
+
+impl std::error::Error for DataStoreError {}
+
+const REDACTED_CONTENT: () = ();
+
+fn check_access(error: anyhow::Error) -> Result<Poll<()>, anyhow::Error> {
+    let root_cause = &error;
+
+    // If the error was caused by redaction, return a tombstone instead
+    // of the content.
+    match root_cause.downcast_ref::<DataStoreError>() {
+        Some(DataStoreError::Censored(_)) => Ok(Poll::Ready(REDACTED_CONTENT)),
+        None => Err(error),
+    }
+}
+```
+
+This is the most common form of downcasting. Use it in `match` or `if let` expressions when you only need to read the error value.
+
+## `error.downcast_mut::<E>()` — Borrow as `&mut E`
+
+Returns `Some(&mut E)` if the underlying error is of type `E`, or `None` otherwise. Use this when you need to mutate the inner error in place — for example, to update a retry counter stored inside a custom error type.
+
+```rust
+use anyhow::Error;
+
+#[derive(Debug)]
+struct RetryableError {
+    attempts: u32,
+    message: String,
+}
+
+impl std::fmt::Display for RetryableError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} (attempted {} times)", self.message, self.attempts)
+    }
+}
+
+impl std::error::Error for RetryableError {}
+
+fn increment_attempt(err: &mut Error) {
+    if let Some(retryable) = err.downcast_mut::<RetryableError>() {
+        retryable.attempts += 1;
+    }
+}
+```
+
+## `error.downcast::<E>()` — Consume and Return `E`
+
+Consumes the `anyhow::Error` and returns `Ok(E)` if the underlying error is of type `E`. If the type does not match, the original error is returned as `Err(self)` — no information is lost.
+
+```rust
+use anyhow::{anyhow, Error};
+use std::io;
+
+fn extract_io_error(err: Error) -> Result<io::Error, Error> {
+    err.downcast::<io::Error>()
+}
+
+fn example() {
+    let err: Error = anyhow!(io::Error::new(io::ErrorKind::TimedOut, "timed out"));
+
+    match extract_io_error(err) {
+        Ok(io_err) => println!("I/O error kind: {:?}", io_err.kind()),
+        Err(other)  => eprintln!("not an I/O error: {}", other),
+    }
+}
+```
+
+Use `downcast` (by value) when you want to take ownership of the inner error — for instance, to store it in a different container, forward it as a typed error, or pass it to a function that requires a concrete type.
+
+## Downcasting Through Context
+
+When context has been attached with `.context()` or `.with_context()`, the `anyhow::Error` actually wraps a `ContextError<C, E>`. Despite this wrapping, **downcasting still works transparently** — it searches the chain and succeeds if `E` matches *either* the context type `C` or the original error type `E`.
+
+```rust
+use anyhow::{Context, Error};
+use std::io;
+
+fn load() -> anyhow::Result<Vec<u8>> {
+    std::fs::read("data.bin")
+        .context("Failed to load data.bin")
+}
+
+fn inspect() {
+    let err: Error = load().unwrap_err();
+
+    // Downcast to io::Error works even though context wraps it
+    if let Some(io_err) = err.downcast_ref::<io::Error>() {
+        println!("OS error code: {}", io_err.raw_os_error().unwrap_or(0));
+    }
+}
+```
+
+<Note>
+  You can freely add `.context()` calls to existing code without worrying that they will break callers that rely on downcasting to the original error type. Context is transparent to all four downcast methods.
+</Note>
+
+## `error.root_cause()` — The Deepest Source
+
+`root_cause()` traverses the entire `source()` chain and returns a reference to the last (innermost) error — the ultimate cause of the failure, with no further `source()` link.
+
+```rust
+use anyhow::Error;
+use std::io;
+
+pub fn underlying_io_error_kind(error: &Error) -> Option<io::ErrorKind> {
+    for cause in error.chain() {
+        if let Some(io_error) = cause.downcast_ref::<io::Error>() {
+            return Some(io_error.kind());
+        }
+    }
+    None
+}
+
+fn show_root(err: &Error) {
+    let root = err.root_cause();
+    eprintln!("root cause: {}", root);
+}
+```
+
+`root_cause()` is equivalent to `error.chain().last().unwrap()`. Use it when you want to skip all intermediate context layers and surface the fundamental failure.
+
+## Full Example: Matching on a Custom Error Type
+
+Here is a complete example showing how to create, propagate, and downcast a domain-specific error within an application that uses `anyhow` throughout.
+
+```rust
+use anyhow::{bail, Context, Result};
+use thiserror::Error;
+
+#[derive(Error, Debug)]
+enum AppError {
+    #[error("permission denied for user {user_id}")]
+    PermissionDenied { user_id: u64 },
+
+    #[error("resource {name:?} not found")]
+    NotFound { name: String },
+}
+
+fn check_permission(user_id: u64) -> Result<()> {
+    if user_id != 0 {
+        bail!(AppError::PermissionDenied { user_id });
+    }
+    Ok(())
+}
+
+fn load_resource(name: &str, user_id: u64) -> Result<String> {
+    check_permission(user_id)
+        .with_context(|| format!("loading resource {name:?}"))?;
+
+    // ... actual loading logic
+    Ok(format!("contents of {name}"))
+}
+
+fn handle_request(name: &str, user_id: u64) {
+    match load_resource(name, user_id) {
+        Ok(data) => println!("data: {}", data),
+        Err(err) => {
+            // Downcast through the context layer to inspect the root cause
+            if let Some(AppError::PermissionDenied { user_id }) =
+                err.downcast_ref::<AppError>()
+            {
+                eprintln!("Access denied for user {}. Return 403.", user_id);
+            } else if let Some(AppError::NotFound { name }) =
+                err.downcast_ref::<AppError>()
+            {
+                eprintln!("Resource {} not found. Return 404.", name);
+            } else {
+                eprintln!("Internal error: {:#}", err);
+            }
+        }
+    }
+}
+
+fn main() {
+    handle_request("reports", 42);
+}
+```
+
+Running this example produces:
+
+```console
+Access denied for user 42. Return 403.
+```
+
+The `downcast_ref::<AppError>()` call succeeds even though `load_resource` attached a `.with_context()` layer around the error returned by `check_permission`.

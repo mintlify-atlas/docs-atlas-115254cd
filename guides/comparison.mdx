@@ -1,0 +1,184 @@
+---
+title: "anyhow vs thiserror vs failure: Choosing the Right Tool"
+sidebarTitle: "Comparison"
+description: "A practical guide to choosing between anyhow, thiserror, and failure — covering design tradeoffs, use cases, and the key differences from Box<dyn Error>."
+---
+
+Rust offers several approaches to error handling, and the right choice depends on whether you are writing application code or library code, whether callers need to inspect error types programmatically, and how much you care about thin-pointer representation and automatic backtraces. This guide explains the tradeoffs between `anyhow`, `thiserror`, the unmaintained `failure` crate, and the primitive `Box<dyn Error>`.
+
+## The High-Level Decision Rule
+
+The single most important factor is whether your code is an **application** or a **library**:
+
+- **Use `anyhow` in application code.** Applications propagate errors up to a top-level handler that formats and reports them to users or operators. The concrete error type rarely matters at that boundary — what matters is a useful message and a readable cause chain.
+- **Use `thiserror` in library code.** Libraries expose error types as part of their public API. Callers need to match against specific variants, implement custom recovery logic, or bubble errors upward in a typed way. `thiserror` lets you define precise, structured error types with minimal boilerplate.
+
+These two crates are designed to be used together, not as alternatives to each other.
+
+---
+
+## anyhow vs thiserror
+
+<Tabs>
+  <Tab title="anyhow (applications)">
+`anyhow::Error` is a type-erased, trait-object-based error type. Every error that implements `std::error::Error + Send + Sync + 'static` can be converted into an `anyhow::Error` via the `?` operator, with no extra code. Context layers can be added at each abstraction boundary. The concrete underlying type is opaque to callers — they can downcast if they need to, but usually they just display or log the error.
+
+```rust
+use anyhow::{Context, Result};
+
+fn load_user(id: u64) -> Result<User> {
+    let row = db::query("SELECT * FROM users WHERE id = ?", id)
+        .with_context(|| format!("Failed to query user {}", id))?;
+
+    let user = User::from_row(row)
+        .context("Failed to deserialize user record")?;
+
+    Ok(user)
+}
+```
+
+No error type enum is needed. Errors from `db::query` and `User::from_row` — which may be completely different types — are both accepted transparently.
+  </Tab>
+  <Tab title="thiserror (libraries)">
+`thiserror` provides a derive macro that generates `std::error::Error` implementations for your own types. The result is a strongly typed error enum whose variants callers can match against. It is the standard tool for designing the error API of a library crate.
+
+```rust
+use thiserror::Error;
+
+#[derive(Error, Debug)]
+pub enum UserError {
+    #[error("User {0} not found")]
+    NotFound(u64),
+    #[error("Invalid field value for {field}: {reason}")]
+    InvalidField { field: String, reason: String },
+    #[error("Database error")]
+    Database(#[from] db::Error),
+}
+
+pub fn load_user(id: u64) -> Result<User, UserError> {
+    let row = db::query("SELECT * FROM users WHERE id = ?", id)?; // db::Error -> UserError::Database
+    let user = User::from_row(row)?;
+    Ok(user)
+}
+```
+
+Callers receive a `UserError` and can recover from specific variants:
+
+```rust
+match load_user(42) {
+    Ok(user) => serve(user),
+    Err(UserError::NotFound(id)) => return_404(id),
+    Err(e) => return_500(e),
+}
+```
+  </Tab>
+</Tabs>
+
+### The Common Pattern: thiserror in Libraries, anyhow in Apps
+
+In a typical Rust project with multiple crates, the library crates define their own error types with `thiserror`, and the application binary ties everything together with `anyhow`. Because `anyhow::Error` accepts any `std::error::Error` implementation, the `?` operator at the application boundary converts library errors transparently:
+
+```rust
+// library crate: strongly typed errors for callers
+#[derive(thiserror::Error, Debug)]
+pub enum FormatError {
+    #[error("Invalid header (expected {expected:?}, got {found:?})")]
+    InvalidHeader { expected: String, found: String },
+    #[error("Missing attribute: {0}")]
+    MissingAttribute(String),
+}
+```
+
+```rust
+// application crate: anyhow for easy propagation and context
+use anyhow::{Context, Result};
+use myformat::FormatError;
+
+fn process_file(path: &str) -> Result<()> {
+    let data = std::fs::read(path)
+        .with_context(|| format!("Cannot open {}", path))?;
+
+    // FormatError impls std::error::Error, so ? converts it into anyhow::Error
+    let parsed = myformat::parse(&data)
+        .context("File format is invalid")?;
+
+    export(parsed).context("Export failed")?;
+    Ok(())
+}
+```
+
+---
+
+## anyhow vs failure
+
+The `failure` crate was an earlier attempt to solve the same problem as `anyhow`. It introduced its own `failure::Fail` trait to work around limitations in `std::error::Error` at the time. The standard library has since incorporated those improvements as part of [RFC 2504](https://github.com/rust-lang/rfcs/blob/master/text/2504-fix-error.md), making a separate trait unnecessary.
+
+| | `failure` | `anyhow` |
+|---|---|---|
+| **Base trait** | `failure::Fail` (custom) | `std::error::Error` (standard) |
+| **Maintenance status** | Unmaintained | Actively maintained |
+| **std integration** | Requires adapter impls | Native |
+| **Backtrace** | Bundled via `failure::Backtrace` | `std::backtrace::Backtrace` (Rust ≥ 1.65) |
+| **Interop with ecosystem** | Limited (separate trait) | Full (any `std::error::Error`) |
+
+**`anyhow` is the modern replacement for `failure`.** If you have a codebase that still uses `failure`, migrating to `anyhow` will improve interoperability with the rest of the Rust ecosystem and remove the dependency on an unmaintained crate.
+
+<Warning>
+The `failure` crate is unmaintained and not recommended for new projects. New Rust error handling code should use `anyhow` and/or `thiserror`.
+</Warning>
+
+---
+
+## anyhow vs `Box<dyn Error>`
+
+`Box<dyn std::error::Error + Send + Sync + 'static>` is the standard library's built-in type-erased error type and requires no dependencies. `anyhow::Error` builds on top of the same concept with several important additions.
+
+### Memory Representation
+
+The most notable difference is pointer size. A `Box<dyn Error>` is a **fat pointer** — two words wide (one for the data pointer, one for the vtable pointer). `anyhow::Error` is a **thin pointer** — exactly one word wide. This matters in performance-sensitive code where errors are stored in structs or passed through many layers:
+
+```rust
+use std::mem::size_of;
+
+// Two words: data pointer + vtable pointer
+assert_eq!(size_of::<Box<dyn std::error::Error + Send + Sync>>(), 16);
+
+// One word: thin pointer, vtable stored alongside the allocation
+assert_eq!(size_of::<anyhow::Error>(), 8);
+```
+
+`anyhow` achieves this by storing the vtable inside the heap allocation rather than in the pointer itself. The resulting `Error` type is `#[repr(transparent)]` over a single raw pointer.
+
+### Feature Comparison
+
+| Feature | `Box<dyn Error>` | `anyhow::Error` |
+|---|---|---|
+| **Pointer width** | 2 words (fat pointer) | 1 word (thin pointer) |
+| **Backtrace capture** | No | Yes (Rust ≥ 1.65, opt-in via env vars) |
+| **Context chaining** | No | Yes, via `.context()` / `.with_context()` |
+| **Downcasting** | Via `Box::downcast` | Via `Error::downcast`, `downcast_ref`, `downcast_mut` |
+| **Send + Sync requirement** | Optional (`Box<dyn Error>` is allowed) | Required (`Send + Sync + 'static`) |
+| **Cause chain iteration** | Manual, via `.source()` | `error.chain()` iterator |
+| **`?` ergonomics** | Works (same constraint) | Works, plus automatic context API |
+
+### The Send + Sync Tradeoff
+
+`anyhow::Error` requires that the underlying error is `Send + Sync + 'static`. This means errors that contain non-`Send` data (like `Rc<T>` or raw pointers) cannot be wrapped in `anyhow::Error`. `Box<dyn Error>` has no such requirement and is more permissive.
+
+In practice, application-level errors should almost always be `Send + Sync + 'static` — you need to be able to send errors across threads (to a background logger, a Tokio task, etc.) and store them for the lifetime of a request. If you find yourself with a non-`Send` error, it is usually a sign that the error type needs redesigning.
+
+---
+
+## When to Use Each
+
+**Use `anyhow` when** you are writing an application binary (`main.rs`, CLI tool, web server handler) and need to propagate errors across many layers without defining an error type for each one. Choose `anyhow` when you want automatic backtrace capture, structured cause chains, and a convenient `?`-and-context workflow — especially when combining errors from many different libraries.
+
+**Use `thiserror` when** you are writing a library crate consumed by others, your callers need to match on specific error variants to implement recovery logic, and you want the error type to be part of your public API contract.
+
+**Use `Box<dyn Error>` when** you want zero dependencies beyond `std`, your error types contain non-`Send` data, or you are writing a very small utility where `anyhow` feels like overkill.
+
+**Avoid `failure`** for any new project — use `anyhow` or `thiserror` instead for full interoperability with the modern Rust ecosystem.
+
+<Tip>
+Using `anyhow` in your app layer and `thiserror` in your library layers is not just allowed — it's the recommended pattern. They are designed to complement each other. The `thiserror`-derived types implement `std::error::Error`, which means they convert into `anyhow::Error` with a plain `?`.
+</Tip>

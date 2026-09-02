@@ -1,0 +1,238 @@
+---
+title: "The anyhow::Error Type Explained"
+sidebarTitle: "Error Type"
+description: "A deep dive into anyhow::Error: its thin-pointer representation, Send+Sync+'static guarantees, display formats, and interop with Box<dyn Error>."
+---
+
+`anyhow::Error` is the central type of the anyhow library — a trait-object-based error type designed for application-level error handling. Unlike writing bespoke error enums for every module, you wrap any `std::error::Error` implementor into a single `anyhow::Error` and propagate it with `?`. The result is ergonomic, composable error handling without sacrificing diagnostic information.
+
+## What Is `anyhow::Error`?
+
+`anyhow::Error` is defined as a `#[repr(transparent)]` struct containing a single `Own<ErrorImpl>` pointer:
+
+```rust
+#[repr(transparent)]
+pub struct Error {
+    inner: Own<ErrorImpl>,
+}
+```
+
+This is a **narrow (one-word) pointer** — the concrete error type and its vtable are bundled into a single heap allocation via a hand-rolled vtable, not a fat pointer. Compare this to `Box<dyn std::error::Error>`, which is a two-word fat pointer (data pointer + vtable pointer).
+
+The three key differences from `Box<dyn std::error::Error>` are:
+
+<CardGroup cols={3}>
+  <Card title="Send + Sync + 'static" icon="shield-check">
+    `anyhow::Error` requires that the wrapped type is `Send`, `Sync`, and `'static`. This makes `anyhow::Error` itself `Send + Sync + 'static`, safe to cross thread boundaries.
+  </Card>
+  <Card title="Guaranteed Backtrace" icon="list-tree">
+    A backtrace is captured at construction time if the underlying error does not already provide one (on Rust ≥ 1.65 with the `std` feature).
+  </Card>
+  <Card title="Narrow Pointer" icon="minimize">
+    Exactly one word in size instead of two, which means it fits in the same space as a regular pointer and generates smaller code.
+  </Card>
+</CardGroup>
+
+## Creating Errors
+
+### `Error::new` — from any `std::error::Error`
+
+Use `Error::new` to wrap a concrete error type that implements `std::error::Error + Send + Sync + 'static`. The source chain and any existing backtrace from the inner error are preserved.
+
+```rust
+use anyhow::Error;
+use std::io;
+
+let io_err = io::Error::new(io::ErrorKind::NotFound, "config file missing");
+let err: Error = Error::new(io_err);
+```
+
+In practice you almost never call `Error::new` directly — the `From` impl makes `?` do it automatically for any compatible error type.
+
+### `Error::msg` — from any printable message
+
+Use `Error::msg` when you have a message string or a value that implements `Display + Debug` but does not implement `std::error::Error`. It is equivalent to the `anyhow!(...)` macro but useful as a function pointer (e.g., in iterator combinators).
+
+```rust
+use anyhow::{Error, Result};
+use futures::stream::{Stream, StreamExt, TryStreamExt};
+
+async fn demo<S>(stream: S) -> Result<Vec<String>>
+where
+    S: Stream<Item = Result<String, &'static str>>,
+{
+    stream
+        .map_err(Error::msg)  // Error::msg used as a function value
+        .try_collect()
+        .await
+}
+```
+
+<Tip>
+  If the argument to `Error::msg` is a `&'static str` literal (no interpolation), it remains downcastable to `&'static str`. If it is an owned `String`, it is downcastable to `String`.
+</Tip>
+
+### `Error::from_boxed` — from a boxed trait object
+
+For interoperability with other error libraries that exchange `Box<dyn std::error::Error + Send + Sync + 'static>`, use `Error::from_boxed`:
+
+```rust
+use anyhow::Error;
+use std::error::Error as StdError;
+
+fn from_other_library(boxed: Box<dyn StdError + Send + Sync + 'static>) -> Error {
+    Error::from_boxed(boxed)
+}
+```
+
+This is a cheap pointer conversion — no additional heap allocation for the error data itself, though a new backtrace is captured if the boxed error does not already provide one.
+
+## Display Representations
+
+`anyhow::Error` supports four formatting modes. The right choice depends on how much detail you want to expose.
+
+<Tabs>
+  <Tab title="{} — outermost only">
+    Prints only the outermost context or error message, exactly as if you had called `Display` on the underlying error directly. Useful for user-facing messages where the cause chain would be noise.
+
+    ```rust
+    eprintln!("{}", err);
+    ```
+
+    ```console
+    Failed to read instrs from ./path/to/instrs.json
+    ```
+  </Tab>
+  <Tab title="{:#} — inline cause chain">
+    Prints the outermost context followed by each cause inline, separated by `: `. Compact and readable in log lines.
+
+    ```rust
+    eprintln!("{:#}", err);
+    ```
+
+    ```console
+    Failed to read instrs from ./path/to/instrs.json: No such file or directory (os error 2)
+    ```
+  </Tab>
+  <Tab title="{:?} — debug with backtrace">
+    The default representation when returning `anyhow::Error` from `fn main`. Prints each cause on its own line prefixed with `Caused by:`, then the stack backtrace (if one was captured).
+
+    ```rust
+    eprintln!("{:?}", err);
+    ```
+
+    ```console
+    Error: Failed to read instrs from ./path/to/instrs.json
+
+    Caused by:
+        No such file or directory (os error 2)
+
+    Stack backtrace:
+       0: <E as anyhow::context::ext::StdError>::ext_context
+                 at /git/anyhow/src/backtrace.rs:26
+       1: core::result::Result<T,E>::map_err
+                 at /git/rustc/src/libcore/result.rs:596
+       2: anyhow::context::<impl anyhow::Context<T,E> for core::result::Result<T,E>>::with_context
+                 at /git/anyhow/src/context.rs:58
+       3: testing::main
+                 at src/main.rs:5
+       4: std::rt::lang_start
+                 at /git/rustc/src/libstd/rt.rs:61
+       5: main
+       6: __libc_start_main
+       7: _start
+    ```
+  </Tab>
+  <Tab title="{:#?} — struct debug">
+    A conventional struct-style debug view. Shows context and source as named fields, which can be easier to read at a glance when there is no need to see the full backtrace.
+
+    ```rust
+    eprintln!("{:#?}", err);
+    ```
+
+    ```console
+    Error {
+        context: "Failed to read instrs from ./path/to/instrs.json",
+        source: Os {
+            code: 2,
+            kind: NotFound,
+            message: "No such file or directory",
+        },
+    }
+    ```
+  </Tab>
+</Tabs>
+
+<Note>
+  When `fn main` returns `Result<(), anyhow::Error>`, Rust uses the `Debug` formatter (`{:?}`) to print the error, so your backtrace and cause chain appear automatically without any extra code.
+</Note>
+
+## The `anyhow::Ok` Helper
+
+Type inference sometimes cannot deduce the error type for an `Ok` value in a function returning `anyhow::Result`. The `anyhow::Ok` function is a drop-in replacement for `Ok` that fixes this without verbose type annotations:
+
+```rust
+// Without anyhow::Ok — compiler error: cannot infer type for E
+// let _ = anyhow::Result::Ok(1);
+
+// With anyhow::Ok — works correctly
+use anyhow::Ok;
+
+fn compute() -> anyhow::Result<i32> {
+    Ok(42)
+}
+```
+
+The function is defined as:
+
+```rust
+pub fn Ok<T>(value: T) -> Result<T> {
+    Result::Ok(value)
+}
+```
+
+It is equivalent to writing `Ok::<_, anyhow::Error>(value)` but much more readable.
+
+## Converting Back to `Box<dyn Error>`
+
+Two methods convert an `anyhow::Error` back into a standard boxed error for interop with code that expects `Box<dyn std::error::Error + Send + Sync + 'static>`.
+
+<Accordion title="into_boxed_dyn_error — cheap pointer cast, backtrace preserved">
+`into_boxed_dyn_error` is a **zero-cost pointer cast** — it reinterprets the existing heap allocation as a `Box<dyn StdError>` without any new allocation. The backtrace remains accessible via the standard library's provider API (nightly `error_generic_member_access`), but the resulting box **cannot be downcast** to the original concrete type.
+
+```rust
+use anyhow::anyhow;
+
+let anyhow_error = anyhow!("something went wrong");
+
+// Cheap cast — no reallocation
+let boxed: Box<dyn std::error::Error + Send + Sync + 'static> =
+    anyhow_error.into_boxed_dyn_error();
+```
+
+This is also available as the `From<anyhow::Error>` impl on `Box<dyn Error + Send + Sync + 'static>`, so `?` and `.into()` work automatically.
+</Accordion>
+
+<Accordion title="reallocate_into_boxed_dyn_error_without_backtrace — new allocation, downcasting preserved">
+`reallocate_into_boxed_dyn_error_without_backtrace` **reallocates** the inner error into a fresh `Box`, strips the backtrace, and exposes the original concrete type for downcasting. Use this when the consumer needs to recover the original error via `downcast_ref::<E>()` or `downcast::<E>()`.
+
+```rust
+use anyhow::anyhow;
+use thiserror::Error;
+
+#[derive(Error, Debug)]
+#[error("my specific error")]
+struct MyError;
+
+let anyhow_error = anyhow!(MyError);
+
+// Reallocates — backtrace lost, but original type recoverable
+let boxed = anyhow_error.reallocate_into_boxed_dyn_error_without_backtrace();
+assert!(boxed.downcast_ref::<MyError>().is_some());
+assert!(boxed.downcast::<MyError>().is_ok());
+```
+</Accordion>
+
+<Info>
+  The `From<anyhow::Error> for Box<dyn StdError + Send + Sync + 'static>` impl calls `into_boxed_dyn_error` (the cheap path). If you need to recover the original type after the conversion, use `reallocate_into_boxed_dyn_error_without_backtrace` explicitly.
+</Info>

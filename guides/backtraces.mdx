@@ -1,0 +1,145 @@
+---
+title: "Automatic Backtraces with anyhow"
+sidebarTitle: "Backtraces"
+description: "How anyhow captures stack backtraces automatically on Rust 1.65+, which env vars control capture, and how to read backtrace output in Debug format."
+---
+
+One of the most time-consuming parts of debugging a production error is figuring out *where* it originated. `anyhow` addresses this by automatically capturing a stack backtrace at the moment an error is constructed — no manual instrumentation required. The backtrace is stored inside the `anyhow::Error` allocation and surfaces whenever the error is formatted with the `Debug` formatter, including the default output of `fn main`.
+
+## Requirements
+
+Backtrace capture relies on `std::backtrace::Backtrace`, which was stabilised in **Rust 1.65**. The `std` feature of anyhow (enabled by default) must be active.
+
+```toml
+# Default — std feature is on, backtraces work on Rust >= 1.65
+[dependencies]
+anyhow = "1.0"
+```
+
+<Note>
+  The crate also exposes a `backtrace` feature flag for historical compatibility with the old `backtrace` crate integration, but **it has no effect in the current release**. It is kept only to avoid breakage for crates that list it in their `Cargo.toml`. You do not need to enable it.
+
+  ```toml
+  # THIS HAS NO EFFECT — kept only for compatibility
+  anyhow = { version = "1.0", features = ["backtrace"] }
+  ```
+</Note>
+
+## `error.backtrace()` — Accessing the Captured Backtrace
+
+When the `std` feature is enabled, `anyhow::Error` exposes a `backtrace` method:
+
+```rust
+#[cfg(feature = "std")]
+pub fn backtrace(&self) -> &std::backtrace::Backtrace
+```
+
+You can call it to obtain a reference to the `std::backtrace::Backtrace` stored inside the error. The backtrace is captured when the error is constructed — either from `Error::new`, `Error::msg`, `Error::from_boxed`, or via the `?` operator — **unless** the underlying error already carries its own backtrace, in which case anyhow does not capture a second one.
+
+```rust
+use anyhow::{anyhow, Result};
+
+fn failing_operation() -> Result<()> {
+    Err(anyhow!("something went wrong"))
+}
+
+fn main() -> Result<()> {
+    let err = failing_operation().unwrap_err();
+
+    // Access the backtrace directly
+    println!("{}", err.backtrace());
+
+    Ok(())
+}
+```
+
+## Controlling Capture with Environment Variables
+
+`std::backtrace::Backtrace` only records frames when the process opts in via environment variables. anyhow captures the backtrace at construction time by calling `Backtrace::capture()`, which respects these variables automatically. No code changes are required — only the environment differs between runs.
+
+| Environment variable setting | Behaviour |
+|---|---|
+| `RUST_BACKTRACE=1` | Backtraces enabled for both panics **and** anyhow errors |
+| `RUST_LIB_BACKTRACE=1` | Backtraces enabled for anyhow errors only (panics unaffected) |
+| `RUST_BACKTRACE=1` and `RUST_LIB_BACKTRACE=0` | Backtraces enabled for panics only; anyhow errors have no backtrace |
+| Neither variable set | No backtraces captured anywhere |
+
+<Tip>
+  During development, `RUST_LIB_BACKTRACE=1` is the most useful setting: you get full stack traces for every `anyhow::Error` without the noise that comes from enabling panic backtraces as well.
+
+  ```bash
+  RUST_LIB_BACKTRACE=1 cargo run
+  ```
+</Tip>
+
+## Backtrace in Debug Output
+
+The backtrace appears automatically when an error is printed with the `{:?}` formatter. This is the representation Rust uses when `fn main` returns an `Err`:
+
+```rust
+fn main() -> anyhow::Result<()> {
+    let _content = std::fs::read("./path/to/instrs.json")
+        .with_context(|| "Failed to read instrs from ./path/to/instrs.json")?;
+    Ok(())
+}
+```
+
+With `RUST_LIB_BACKTRACE=1` set, running this prints:
+
+```console
+Error: Failed to read instrs from ./path/to/instrs.json
+
+Caused by:
+    No such file or directory (os error 2)
+
+Stack backtrace:
+   0: <E as anyhow::context::ext::StdError>::ext_context
+             at /git/anyhow/src/backtrace.rs:26
+   1: core::result::Result<T,E>::map_err
+             at /git/rustc/src/libcore/result.rs:596
+   2: anyhow::context::<impl anyhow::Context<T,E> for core::result::Result<T,E>>::with_context
+             at /git/anyhow/src/context.rs:58
+   3: testing::main
+             at src/main.rs:5
+   4: std::rt::lang_start
+             at /git/rustc/src/libstd/rt.rs:61
+   5: main
+   6: __libc_start_main
+   7: _start
+```
+
+Without either environment variable set, the same program prints only the cause chain with no `Stack backtrace:` section:
+
+```console
+Error: Failed to read instrs from ./path/to/instrs.json
+
+Caused by:
+    No such file or directory (os error 2)
+```
+
+## Backtrace Capture Logic
+
+anyhow captures a backtrace **only if the underlying error does not already have one**. The `backtrace_if_absent!` macro (used internally) checks whether the error provides a `std::backtrace::Backtrace` via the standard library's provider API before capturing a new one. This avoids double-capturing in codebases where some errors (e.g., those defined with `thiserror` and `#[backtrace]`) already carry their own trace.
+
+```rust
+// Internal logic (simplified):
+// Only capture a fresh backtrace if the error provides none of its own.
+let backtrace = backtrace_if_absent!(&error);
+Error::construct_from_std(error, backtrace)
+```
+
+When you attach context with `.context()` on an already-constructed `anyhow::Error`, no second backtrace is captured because the inner error already has one stored.
+
+## No-std Behaviour
+
+In no-std mode (`default-features = false`), backtrace capture is unavailable — `std::backtrace::Backtrace` requires the standard library. The `backtrace()` method is not present and the `backtrace` field inside `ErrorImpl` is always `None`. All other anyhow APIs work identically.
+
+```toml
+# no-std mode — backtraces not available
+[dependencies]
+anyhow = { version = "1.0", default-features = false }
+```
+
+<Warning>
+  If you distribute a library crate that uses anyhow internally, be aware that consumers who enable backtraces will see frames from inside your library. This is generally desirable for debugging but may reveal implementation details you consider private. Using `thiserror` for your public error types and anyhow only for internal propagation is a common pattern to address this.
+</Warning>

@@ -1,0 +1,183 @@
+---
+title: "Using anyhow Without the Standard Library"
+sidebarTitle: "No-std"
+description: "How to enable anyhow's no_std mode, what API remains available, global allocator requirements, and key differences from the default std-enabled build."
+---
+
+Rust's `std` crate is unavailable in embedded environments, operating system kernels, WebAssembly modules without WASI, and other constrained targets. The `anyhow` crate supports these targets through a no_std build mode that provides nearly the full API surface — the same `anyhow::Error` type, the same macros, the same `?`-propagation ergonomics — without depending on the standard library.
+
+## What no_std Mode Is and When to Use It
+
+By default, `anyhow` enables a `std` feature flag that links against the Rust standard library. Disabling this feature switches the crate to a `no_std` build that depends only on `core` and `alloc`. You might use no_std mode when:
+
+- You are writing firmware or an embedded application where `std` is unavailable.
+- You are building a library crate that must be usable in both `std` and `no_std` contexts.
+- You are targeting an environment like a WASM component or a kernel module where heap allocation is available but the full standard library is not.
+
+<Note>
+Even in no_std mode, `anyhow` requires a global allocator. The `anyhow::Error` type always heap-allocates the underlying error value, so environments with no allocator at all cannot use `anyhow`.
+</Note>
+
+## Enabling no_std Mode
+
+To depend on `anyhow` without the standard library, set `default-features = false` in your `Cargo.toml`. This disables the `std` feature flag:
+
+```toml
+[dependencies]
+anyhow = { version = "1.0", default-features = false }
+```
+
+You must also declare a global allocator in your crate. For example, using a common embedded allocator:
+
+```toml
+[dependencies]
+anyhow = { version = "1.0", default-features = false }
+linked-list-allocator = "0.10"
+```
+
+```rust
+#![no_std]
+extern crate alloc;
+
+use linked_list_allocator::LockedHeap;
+
+#[global_allocator]
+static ALLOCATOR: LockedHeap = LockedHeap::empty();
+```
+
+With that in place, `anyhow`'s types and macros are available in your `no_std` crate just as they would be in a `std` project:
+
+```rust
+#![no_std]
+extern crate alloc;
+
+use anyhow::{bail, ensure, Context, Result};
+
+fn parse_frame(data: &[u8]) -> Result<Frame> {
+    ensure!(data.len() >= 4, "frame too short: {} bytes", data.len());
+
+    let length = u32::from_be_bytes(data[..4].try_into()
+        .context("failed to read frame length header")?);
+
+    if length as usize > data.len() - 4 {
+        bail!("frame declares length {} but only {} bytes available", length, data.len() - 4);
+    }
+
+    Ok(Frame::parse(&data[4..4 + length as usize])
+        .context("failed to parse frame body")?)
+}
+```
+
+## The `std` Feature Flag
+
+The `std` feature is the only user-facing feature that meaningfully affects `anyhow`'s behavior. It is enabled by default.
+
+```toml
+[features]
+default = ["std"]
+std = []
+```
+
+<Info>
+The `backtrace` feature listed in older documentation and the `Cargo.toml` has no effect in current versions of anyhow (1.0.104). It exists only for backward compatibility with projects that previously listed it explicitly. Backtrace capture is handled automatically through the standard library on Rust ≥ 1.65 and requires no feature flag.
+</Info>
+
+## What Is Available in no_std Mode
+
+Almost the entire public API works identically in no_std mode:
+
+- `anyhow::Error` — the core error type, thin-pointer representation, with downcasting, context chaining, and `?`-propagation.
+- `anyhow::Result<T>` — the type alias for `Result<T, anyhow::Error>`.
+- `anyhow!`, `bail!`, `ensure!` macros — all work as in std mode.
+- `Error::new`, `Error::msg`, `Error::from_boxed`, `Error::into_boxed_dyn_error` — construction and interop methods.
+- `Error::chain()`, `Error::root_cause()` — cause-chain iteration.
+- `Error::downcast()`, `Error::downcast_ref()`, `Error::downcast_mut()`, `Error::is()` — type-based downcasting.
+- `Context` trait — `.context()` and `.with_context()` on `Result` values.
+- `Chain` iterator — iterates all causes in the error chain.
+
+## What Differs in no_std Mode
+
+The primary difference is backtrace support.
+
+**`Error::backtrace()` is not available.** This method is gated on `#[cfg(feature = "std")]` because `std::backtrace::Backtrace` is a standard-library type. In no_std mode, `anyhow::Error` does not capture or store backtraces.
+
+```rust
+// This method exists only with `feature = "std"`:
+#[cfg(feature = "std")]
+pub fn backtrace(&self) -> &Backtrace { ... }
+```
+
+Everything else — error propagation, context attachment, downcasting, chain iteration — works exactly as in std mode.
+
+## Rust Version Considerations
+
+`anyhow` requires Rust 1.68 as its minimum supported Rust version (MSRV). In no_std mode, there is an additional consideration for the `?` operator when working across error-type boundaries.
+
+**Rust ≥ 1.81**: `core::error::Error` was stabilized, making the `From` trait implementations that back `?`-based conversions available in `core`. In this version and later, `?` works identically in no_std and std mode.
+
+**Rust < 1.81**: The `From<E> for anyhow::Error` impl relies on `std::error::Error`, which is only available in std mode. If you are working with a non-`anyhow` error type inside a function that returns `anyhow::Result`, the `?` operator may fail to compile. The workaround is to call `.map_err(Error::msg)` explicitly:
+
+```rust
+use anyhow::{Error, Result};
+
+fn read_config(data: &[u8]) -> Result<Config> {
+    // On Rust < 1.81 in no_std mode, ? may not work directly for some error types.
+    // Use .map_err(Error::msg) as a workaround.
+    let config = Config::parse(data).map_err(Error::msg)?;
+    Ok(config)
+}
+```
+
+<Tip>
+If your target toolchain is Rust ≥ 1.81, `core::error::Error` is available and you will not encounter this limitation. The `?` operator works on any type that implements `core::error::Error + Send + Sync + 'static`.
+</Tip>
+
+## Complete no_std Example
+
+Here is a self-contained example showing a no_std crate with a global allocator and `anyhow`-based error handling:
+
+<CodeGroup>
+```toml Cargo.toml
+[package]
+name = "my-embedded-app"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = { version = "1.0", default-features = false }
+```
+
+```rust src/main.rs
+#![no_std]
+#![no_main]
+extern crate alloc;
+
+use alloc::vec::Vec;
+use anyhow::{bail, ensure, Context, Result};
+
+fn parse_packet(buf: &[u8]) -> Result<Packet> {
+    ensure!(buf.len() >= 8, "packet too short: need 8 bytes, got {}", buf.len());
+
+    let magic = u32::from_be_bytes(buf[..4].try_into().context("bad magic bytes")?);
+    if magic != 0xDEAD_BEEF {
+        bail!("invalid magic number: {:#010x}", magic);
+    }
+
+    let payload_len = u32::from_be_bytes(buf[4..8].try_into().context("bad length field")?) as usize;
+    ensure!(
+        buf.len() >= 8 + payload_len,
+        "truncated payload: declared {} bytes, only {} available",
+        payload_len,
+        buf.len() - 8
+    );
+
+    Ok(Packet {
+        payload: buf[8..8 + payload_len].to_vec(),
+    })
+}
+
+struct Packet {
+    payload: Vec<u8>,
+}
+```
+</CodeGroup>

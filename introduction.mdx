@@ -1,0 +1,98 @@
+---
+title: "anyhow: Flexible Error Handling for Rust Apps"
+sidebarTitle: "Introduction"
+description: "anyhow provides a single, flexible error type for Rust applications — simplifying error propagation, context attachment, and reporting without boilerplate."
+---
+
+Rust's type system makes error handling explicit and safe, but propagating errors through application code often demands repetitive boilerplate: defining error enums, implementing `From` conversions, and boxing errors into `Box<dyn Error>`. The `anyhow` crate solves this with a single, ergonomic `anyhow::Error` type that wraps any error implementing `std::error::Error`, works seamlessly with the `?` operator, and automatically captures backtraces — so you spend less time wiring up error plumbing and more time writing application logic.
+
+## What is anyhow?
+
+`anyhow` provides [`anyhow::Error`](https://docs.rs/anyhow/1.0/anyhow/struct.Error.html), a trait-object–based error type designed for **application-level** error handling in Rust. It is a wrapper that can hold any error implementing `std::error::Error + Send + Sync + 'static`, meaning you can propagate errors from the standard library, third-party crates, or your own types through a single return type: `anyhow::Result<T>`.
+
+```rust
+use anyhow::Result;
+
+fn get_cluster_info() -> Result<ClusterMap> {
+    let config = std::fs::read_to_string("cluster.json")?;
+    let map: ClusterMap = serde_json::from_str(&config)?;
+    Ok(map)
+}
+```
+
+The `?` operator automatically converts any compatible error into `anyhow::Error`. No `From` impls, no manual boxing, no wrapper enums required.
+
+## Why anyhow?
+
+### Compared to `Box<dyn std::error::Error>`
+
+`Box<dyn std::error::Error>` is the lowest-common-denominator approach — it erases the error type but comes with real limitations:
+
+- It is **two words wide** (fat pointer). `anyhow::Error` is always exactly **one word** (a narrow pointer).
+- It gives you no context attachment mechanism.
+- It provides no backtrace guarantee.
+- `Box<dyn Error>` is not `Send + Sync` by default, which causes problems with async runtimes.
+
+`anyhow::Error` requires `Send + Sync + 'static`, captures backtraces automatically on Rust ≥ 1.65, and provides a rich `.context()` API for human-readable error chains.
+
+### Compared to `thiserror`
+
+`thiserror` and `anyhow` solve complementary problems:
+
+| | `anyhow` | `thiserror` |
+|---|---|---|
+| **Best for** | Application code | Library code |
+| **Error type** | Single opaque `anyhow::Error` | Custom typed error enums |
+| **Caller can match on variants** | No (use downcasting) | Yes |
+| **Boilerplate** | None | Minimal (proc-macro derive) |
+| **Context / cause chain** | Built-in `.context()` | Via `#[source]` attribute |
+
+Use `anyhow` when your callers don't need to programmatically match on specific error variants — typical in CLI tools, web servers, data pipelines, and other application-level code. Use `thiserror` when you are writing a library and want to expose a stable, typed error API to downstream crates.
+
+<Note>
+There's no conflict between the two: you can use `thiserror` to define structured error types in library crates, then let application code wrap and propagate them through `anyhow::Error`.
+</Note>
+
+## Key Features
+
+<CardGroup cols={2}>
+  <Card title="The Error Type" icon="shield" href="/guides/error-type">
+    A single-word, `Send + Sync + 'static` error wrapper that replaces `Box<dyn Error>` with a richer API and automatic backtrace capture.
+  </Card>
+  <Card title="Context & Cause Chains" icon="layers" href="/guides/context">
+    Attach human-readable context to any error with `.context()` and `.with_context()`, building structured "Caused by:" chains automatically.
+  </Card>
+  <Card title="Downcasting" icon="arrow-down" href="/guides/downcasting">
+    Recover the original concrete error type at any time via `downcast_ref::<T>()`, `downcast_mut::<T>()`, or `downcast::<T>()` by value.
+  </Card>
+  <Card title="Backtraces" icon="list" href="/guides/backtraces">
+    On Rust ≥ 1.65, a `std::backtrace::Backtrace` is captured automatically when an error is created and printed when `RUST_BACKTRACE=1` is set.
+  </Card>
+</CardGroup>
+
+## When to Use anyhow
+
+**Use `anyhow` in application code** — binaries, CLIs, web services, scripts — where the primary goal is to surface a clear, actionable error message to an operator or user. In these contexts you control the entire call stack and callers don't need to inspect or match on specific error variants.
+
+**Do not use `anyhow` as a public API type in library crates.** Library authors should expose typed errors (using `thiserror` or manual `std::error::Error` impls) so downstream callers can handle specific failure modes programmatically. An opaque `anyhow::Error` in a library's public API deprives callers of the information they need to react appropriately.
+
+<Tip>
+A common pattern is to use `thiserror` for domain errors inside a library and depend on `anyhow` only in `[dev-dependencies]` or in the binary crate that links everything together.
+</Tip>
+
+## no_std Support
+
+`anyhow` works in `no_std` environments. Almost the entire API remains available — the only requirement is a global allocator. To opt in, disable the default `std` feature:
+
+```toml
+[dependencies]
+anyhow = { version = "1.0", default-features = false }
+```
+
+<Warning>
+With Rust versions older than 1.81, `no_std` mode may require an explicit `.map_err(Error::msg)` when propagating non-`anyhow` errors with `?`, because the `From`-based `?` conversion trait is only available in `std` on those older toolchains.
+</Warning>
+
+## Minimum Rust Version
+
+`anyhow` 1.0.104 requires **Rust 1.68** or later. Backtrace capture is available on Rust ≥ 1.65, which is covered by the MSRV. The crate is tested against stable, beta, and nightly channels.

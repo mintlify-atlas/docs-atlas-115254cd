@@ -1,0 +1,460 @@
+---
+title: "anyhow::Error — The Core Error Type Reference"
+sidebarTitle: "Error"
+description: "Complete API reference for anyhow::Error, a thin-pointer trait-object error type with downcasting, context chaining, and optional backtrace capture."
+---
+
+`anyhow::Error` is the central type of the anyhow crate — a single-word, heap-allocated wrapper around any error that implements `std::error::Error + Send + Sync + 'static`. It differs from `Box<dyn std::error::Error>` in three important ways: it is a *thin pointer* (one word, not two), it guarantees a captured backtrace, and it supports ergonomic downcasting back to the original type even through layers of added context.
+
+## Definition
+
+```rust
+#[repr(transparent)]
+pub struct Error {
+    inner: Own<ErrorImpl>,
+}
+```
+
+`Error` is `repr(transparent)` over a single-word `Own<ErrorImpl>` pointer. `ErrorImpl` stores the vtable, an optional `Backtrace`, and the concrete error value — all behind one raw pointer. There is no fat pointer or second word.
+
+## Trait Implementations
+
+<CardGroup cols={2}>
+  <Card title="Display">
+    Prints only the outermost error or context message. Use `{:#}` for the alternate form, which appends all causes inline.
+  </Card>
+  <Card title="Debug">
+    Prints the full cause chain with `Caused by:` headers, plus the captured backtrace when one is available.
+  </Card>
+  <Card title="Drop">
+    Invokes the type-erased vtable destructor, correctly deallocating the concrete `ErrorImpl<E>` allocation.
+  </Card>
+  <Card title="Deref / DerefMut">
+    Targets `dyn StdError + Send + Sync + 'static`, giving direct access to the `std::error::Error` interface.
+  </Card>
+  <Card title="From&lt;E: StdError + Send + Sync + 'static&gt;">
+    Enables `?` from any compatible standard-library error type into `anyhow::Error`.
+  </Card>
+  <Card title="UnwindSafe / RefUnwindSafe">
+    Safe to use across `catch_unwind` boundaries despite the type-erased interior.
+  </Card>
+  <Card title="From&lt;Error&gt; for Box&lt;dyn StdError + …&gt;">
+    Converts via `into_boxed_dyn_error()`. Implemented for the `Send + Sync`, `Send`, and neither variants.
+  </Card>
+  <Card title="AsRef&lt;dyn StdError&gt;">
+    Implemented for both `dyn StdError + Send + Sync` and plain `dyn StdError`.
+  </Card>
+</CardGroup>
+
+---
+
+## Constructors
+
+### `Error::new`
+
+Creates an `anyhow::Error` from any error type that implements `StdError + Send + Sync + 'static`. If the underlying error does not already carry a backtrace, one is captured at this call site.
+
+```rust
+pub fn new<E>(error: E) -> Self
+where
+    E: StdError + Send + Sync + 'static,
+```
+
+<Note>
+Available only when the `std` feature is enabled or when `core::error::Error` is stable (Rust ≥ 1.81 in no_std mode).
+</Note>
+
+<ParamField path="error" type="E: StdError + Send + Sync + 'static" required>
+  The concrete error value to wrap. The error's own `source()` chain is preserved and remains accessible through `Error::chain()`.
+</ParamField>
+
+```rust
+use anyhow::Error;
+use std::io;
+
+let io_err = io::Error::new(io::ErrorKind::NotFound, "config.toml not found");
+let err: Error = Error::new(io_err);
+eprintln!("{:?}", err); // prints cause chain + backtrace
+```
+
+---
+
+### `Error::msg`
+
+Creates an `anyhow::Error` from any printable message. The value does not need to implement `std::error::Error` — only `Display + Debug + Send + Sync + 'static`. This is what the `anyhow!` macro calls internally for string literals and interpolations.
+
+```rust
+pub fn msg<M>(message: M) -> Self
+where
+    M: Display + Debug + Send + Sync + 'static,
+```
+
+<ParamField path="message" type="M: Display + Debug + Send + Sync + 'static" required>
+  The message to use as the error. `String` and `&'static str` are the most common choices. The resulting `Error` can be downcast back to `M`.
+</ParamField>
+
+```rust
+use anyhow::Error;
+use futures::stream::{Stream, StreamExt, TryStreamExt};
+
+// Useful as a function pointer in iterator/stream combinators
+async fn process<S: Stream<Item = &'static str>>(stream: S) -> anyhow::Result<Vec<String>> {
+    stream
+        .map(Ok)
+        .map_err(Error::msg)
+        .try_collect()
+        .await
+}
+```
+
+---
+
+### `Error::from_boxed`
+
+Constructs an `anyhow::Error` from a type-erased `Box<dyn StdError + Send + Sync + 'static>`. A backtrace is captured if the boxed error does not already provide one. This is primarily useful for interoperability with other error libraries.
+
+```rust
+pub fn from_boxed(boxed_error: Box<dyn StdError + Send + Sync + 'static>) -> Self
+```
+
+<ParamField path="boxed_error" type="Box<dyn StdError + Send + Sync + 'static>" required>
+  A pre-erased error. The original concrete type cannot be recovered by downcasting after this conversion.
+</ParamField>
+
+```rust
+use std::error::Error as StdError;
+
+// Bridging from a library that produces Box<dyn StdError + Send + Sync>
+fn wrap_library_error(
+    boxed: Box<dyn StdError + Send + Sync + 'static>,
+) -> anyhow::Error {
+    anyhow::Error::from_boxed(boxed)
+}
+```
+
+---
+
+## Instance Methods
+
+### `context`
+
+Attaches a human-readable context message that becomes the new outermost error. The original error is preserved as the source. Downcasting through context works transparently — you can downcast to either the context type `C` **or** the original error type `E`.
+
+```rust
+pub fn context<C>(self, context: C) -> Self
+where
+    C: Display + Send + Sync + 'static,
+```
+
+<ParamField path="context" type="C: Display + Send + Sync + 'static" required>
+  The context message. Any type that implements `Display` works, including formatted `String`s and structured types that carry machine-readable information.
+</ParamField>
+
+```rust
+use anyhow::Result;
+use std::fs::File;
+use std::path::Path;
+
+struct ParseError { line: usize, column: usize }
+impl std::fmt::Display for ParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "parse error at line {}, col {}", self.line, self.column)
+    }
+}
+impl std::fmt::Debug for ParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "ParseError {{ line: {}, column: {} }}", self.line, self.column)
+    }
+}
+impl std::error::Error for ParseError {}
+
+pub fn parse(path: impl AsRef<Path>) -> Result<()> {
+    let file = File::open(&path)?;
+    Err(ParseError { line: 42, column: 7 })
+        .map_err(|error| {
+            let msg = format!(
+                "only the first {} lines of {} are valid",
+                error.line,
+                path.as_ref().display(),
+            );
+            anyhow::Error::new(error).context(msg)
+        })
+}
+```
+
+---
+
+### `backtrace`
+
+Returns a reference to the backtrace captured when this error was constructed. The backtrace is present when either `RUST_BACKTRACE=1` or `RUST_LIB_BACKTRACE=1` is set in the environment.
+
+```rust
+#[cfg(feature = "std")]
+pub fn backtrace(&self) -> &Backtrace
+```
+
+<Note>
+Only available with the `std` feature (enabled by default). On Rust ≥ 1.65 the return type is `&std::backtrace::Backtrace`. On older compilers with the optional `backtrace` feature crate, it returns `&(impl Debug + Display)`.
+</Note>
+
+```rust
+use anyhow::anyhow;
+
+let err = anyhow!("something went wrong");
+// Prints the backtrace if RUST_BACKTRACE=1 or RUST_LIB_BACKTRACE=1
+println!("{}", err.backtrace());
+```
+
+---
+
+### `chain`
+
+Returns a `Chain` iterator that visits every error in the cause chain, starting from the outermost error and following each `source()` link down to the root cause.
+
+```rust
+#[cfg(any(feature = "std", not(anyhow_no_core_error)))]
+pub fn chain(&self) -> Chain<'_>
+```
+
+```rust
+use anyhow::Error;
+use std::io;
+
+pub fn underlying_io_error_kind(error: &Error) -> Option<io::ErrorKind> {
+    for cause in error.chain() {
+        if let Some(io_error) = cause.downcast_ref::<io::Error>() {
+            return Some(io_error.kind());
+        }
+    }
+    None
+}
+```
+
+---
+
+### `root_cause`
+
+Returns the lowest-level error in the cause chain — equivalent to calling `error.chain().last()`.
+
+```rust
+#[cfg(any(feature = "std", not(anyhow_no_core_error)))]
+pub fn root_cause(&self) -> &(dyn StdError + 'static)
+```
+
+```rust
+use anyhow::anyhow;
+
+let err = anyhow!("top level")
+    .context("middle context");
+
+// The root cause is the original anyhow error created by anyhow!()
+let root = err.root_cause();
+println!("Root: {}", root);
+```
+
+---
+
+## Downcasting Methods
+
+Anyhow supports three downcasting modes — by value, by shared reference, and by mutable reference. For errors with attached context, downcasting succeeds for **both** the context type `C` and the wrapped error type `E`.
+
+### `is`
+
+Returns `true` if the error's concrete type is `E`, without consuming the error.
+
+```rust
+pub fn is<E>(&self) -> bool
+where
+    E: Display + Debug + Send + Sync + 'static,
+```
+
+```rust
+use std::io;
+
+fn report(err: &anyhow::Error) {
+    if err.is::<io::Error>() {
+        eprintln!("I/O failure: {}", err);
+    } else {
+        eprintln!("Unexpected error: {:?}", err);
+    }
+}
+```
+
+---
+
+### `downcast`
+
+Attempts to extract the concrete error value by consuming `self`. Returns `Ok(E)` on success or `Err(Self)` if the type does not match, allowing callers to try multiple types without losing the error.
+
+```rust
+pub fn downcast<E>(self) -> Result<E, Self>
+where
+    E: Display + Debug + Send + Sync + 'static,
+```
+
+<ParamField path="E" type="type parameter">
+  The concrete error type to downcast to. Must implement `Display + Debug + Send + Sync + 'static`.
+</ParamField>
+
+```rust
+use std::io;
+
+fn handle(err: anyhow::Error) {
+    match err.downcast::<io::Error>() {
+        Ok(io_err) => eprintln!("I/O error: {}", io_err),
+        Err(other) => eprintln!("Other error: {:?}", other),
+    }
+}
+```
+
+---
+
+### `downcast_ref`
+
+Attempts to downcast by shared reference. Returns `Some(&E)` on success or `None` if the type does not match.
+
+```rust
+pub fn downcast_ref<E>(&self) -> Option<&E>
+where
+    E: Display + Debug + Send + Sync + 'static,
+```
+
+```rust
+use anyhow::anyhow;
+use std::task::Poll;
+
+#[derive(Debug)]
+enum DataStoreError { Censored(()) }
+impl std::fmt::Display for DataStoreError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, "censored") }
+}
+impl std::error::Error for DataStoreError {}
+
+const REDACTED_CONTENT: () = ();
+
+fn handle(error: anyhow::Error) -> Result<Poll<()>, anyhow::Error> {
+    match error.downcast_ref::<DataStoreError>() {
+        Some(DataStoreError::Censored(_)) => Ok(Poll::Ready(REDACTED_CONTENT)),
+        None => Err(error),
+    }
+}
+```
+
+---
+
+### `downcast_mut`
+
+Attempts to downcast by mutable reference, allowing in-place mutation of the concrete error.
+
+```rust
+pub fn downcast_mut<E>(&mut self) -> Option<&mut E>
+where
+    E: Display + Debug + Send + Sync + 'static,
+```
+
+```rust
+#[derive(Debug)]
+struct RetryableError { retries_left: u32 }
+impl std::fmt::Display for RetryableError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} retries left", self.retries_left)
+    }
+}
+impl std::error::Error for RetryableError {}
+
+fn decrement_retries(err: &mut anyhow::Error) {
+    if let Some(r) = err.downcast_mut::<RetryableError>() {
+        r.retries_left = r.retries_left.saturating_sub(1);
+    }
+}
+```
+
+---
+
+## Conversion Methods
+
+### `into_boxed_dyn_error`
+
+Converts `anyhow::Error` into a `Box<dyn StdError + Send + Sync + 'static>` via a cheap pointer cast — no allocation or deallocation occurs. Any captured backtrace remains accessible through the standard library's provider API (on nightly with `error_generic_member_access`), but the resulting box **can no longer be downcast** to the original concrete type.
+
+```rust
+#[cfg(any(feature = "std", not(anyhow_no_core_error)))]
+pub fn into_boxed_dyn_error(self) -> Box<dyn StdError + Send + Sync + 'static>
+```
+
+```rust
+use anyhow::anyhow;
+
+fn send_to_library(err: anyhow::Error) -> Box<dyn std::error::Error + Send + Sync> {
+    // Same as: Box::<dyn std::error::Error + Send + Sync>::from(err)
+    err.into_boxed_dyn_error()
+}
+```
+
+---
+
+### `reallocate_into_boxed_dyn_error_without_backtrace`
+
+Converts `anyhow::Error` into a `Box<dyn StdError + Send + Sync + 'static>` by **reallocating** the underlying error into a fresh box, enabling downcast to the original concrete type `E`. The captured backtrace is discarded in the process.
+
+```rust
+#[cfg(any(feature = "std", not(anyhow_no_core_error)))]
+pub fn reallocate_into_boxed_dyn_error_without_backtrace(
+    self,
+) -> Box<dyn StdError + Send + Sync + 'static>
+```
+
+<Tip>
+Use `into_boxed_dyn_error()` when backtrace access via the provider API is important. Use `reallocate_into_boxed_dyn_error_without_backtrace()` when you need to downcast the resulting `Box` to the original error type.
+</Tip>
+
+```rust
+use anyhow::anyhow;
+
+#[derive(Debug)]
+struct MyError;
+impl std::fmt::Display for MyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, "my error") }
+}
+impl std::error::Error for MyError {}
+
+let anyhow_err = anyhow!(MyError);
+let boxed = anyhow_err.reallocate_into_boxed_dyn_error_without_backtrace();
+
+// Can downcast to the original type
+assert!(boxed.downcast_ref::<MyError>().is_some());
+assert!(boxed.downcast::<MyError>().is_ok());
+```
+
+---
+
+## Display Representations
+
+<Accordion title="Summary of format specifiers">
+
+| Specifier | Output |
+|-----------|--------|
+| `{}` | Outermost error message only |
+| `{:#}` | Outermost: innermost inline, e.g. `"Failed to read file: No such file or directory"` |
+| `{:?}` | Full cause chain with `Caused by:` labels, plus backtrace if available |
+| `{:#?}` | Struct-style debug showing `context` and `source` fields |
+
+</Accordion>
+
+```rust
+use anyhow::{Context, Result};
+
+fn main() {
+    if let Err(err) = try_main() {
+        eprintln!("ERROR: {}", err);
+        err.chain().skip(1).for_each(|cause| eprintln!("because: {}", cause));
+        std::process::exit(1);
+    }
+}
+
+fn try_main() -> Result<()> {
+    std::fs::read_to_string("cluster.json")
+        .context("Failed to read cluster config")?;
+    Ok(())
+}
+```

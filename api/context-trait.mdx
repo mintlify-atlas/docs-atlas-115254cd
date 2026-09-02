@@ -1,0 +1,222 @@
+---
+title: "anyhow::Context — Error Context Extension Trait"
+sidebarTitle: "Context"
+description: "The sealed Context trait adds context() and with_context() to Result and Option, annotating errors with messages while preserving full downcast access."
+---
+
+The `Context` trait is the primary way to annotate errors with human-readable information as they propagate up the call stack. It extends both `Result<T, E>` and `Option<T>`, allowing you to attach a descriptive message to any failing operation. When the annotated error is eventually displayed or logged, the context forms a readable chain showing what the application was doing when things went wrong.
+
+## Trait Definition
+
+`Context` is a **sealed trait** — it cannot be implemented for types outside of the `anyhow` crate. This guarantees that both method signatures and their downcasting semantics remain stable. The trait is defined in `anyhow::Context` and must be imported before use.
+
+```rust
+pub trait Context<T, E>: private::Sealed {
+    fn context<C>(self, context: C) -> Result<T, Error>
+    where
+        C: Display + Send + Sync + 'static;
+
+    fn with_context<C, F>(self, f: F) -> Result<T, Error>
+    where
+        C: Display + Send + Sync + 'static,
+        F: FnOnce() -> C;
+}
+```
+
+## Implementations
+
+The `Context` trait is implemented for the two types you are most likely to encounter in fallible Rust code:
+
+- **`impl<T, E: StdError + Send + Sync + 'static> Context<T, E> for Result<T, E>`** — Wraps any `Result` whose error type implements `std::error::Error`. The original error becomes the `source` of the new `anyhow::Error`.
+- **`impl<T> Context<T, Infallible> for Option<T>`** — Converts an `Option` to a `Result`, turning `None` into an `anyhow::Error` carrying the provided context message. Because `Option` has no underlying error, the context message itself becomes the sole error.
+
+## Methods
+
+### `context`
+
+Wraps the error with an **eagerly evaluated** context value. The context is always computed, even when the result is `Ok`. Prefer this form when the context is a static string literal or a value that is already constructed.
+
+<ParamField path="context" type="C: Display + Send + Sync + 'static">
+  The context value to attach. Any type implementing `Display` works — a `&'static str`, `String`, or a custom type. The value must be `Send + Sync + 'static` so the resulting error can be safely shared across threads and stored for arbitrary lifetimes.
+</ParamField>
+
+```rust
+use anyhow::{Context, Result};
+use std::fs;
+
+fn load_config(path: &str) -> Result<String> {
+    fs::read_to_string(path)
+        .context("Failed to read configuration file")
+}
+```
+
+### `with_context`
+
+Wraps the error with a **lazily evaluated** closure. The closure is only called when the result is `Err`, making this the preferred choice whenever computing the context message requires allocations or formatting.
+
+<ParamField path="f" type="F: FnOnce() -> C">
+  A closure that produces the context value. Only invoked on the error path, so format strings involving runtime values can be used freely without paying any cost on the success path.
+</ParamField>
+
+```rust
+use anyhow::{Context, Result};
+use std::fs;
+
+fn load_user_file(username: &str, filename: &str) -> Result<Vec<u8>> {
+    let path = format!("/home/{}/{}", username, filename);
+    fs::read(&path)
+        .with_context(|| format!("Failed to read {} for user {}", filename, username))
+}
+```
+
+## Usage Examples
+
+<Tabs>
+  <Tab title="Context on Result">
+    Attach a static description when reading a file. The OS error (`No such file or directory`) is preserved as the cause and appears below the context in the rendered error output.
+
+    ```rust
+    use anyhow::{Context, Result};
+    use std::fs;
+    use std::path::PathBuf;
+
+    pub struct ImportantThing {
+        path: PathBuf,
+    }
+
+    pub fn do_it(it: &ImportantThing) -> Result<Vec<u8>> {
+        let path = &it.path;
+        let content = fs::read(path)
+            .with_context(|| format!("Failed to read instrs from {}", path.display()))?;
+        Ok(content)
+    }
+    ```
+
+    When this error is printed with `{:?}` (the default `fn main` representation):
+
+    ```console
+    Error: Failed to read instrs from ./path/to/instrs.json
+
+    Caused by:
+        No such file or directory (os error 2)
+    ```
+  </Tab>
+  <Tab title="Context on Option">
+    When working with `Option`, context turns `None` into a descriptive error. There is no underlying cause — the context message is the entire error.
+
+    ```rust
+    use anyhow::{Context, Result};
+
+    fn get_username(id: u64) -> Option<String> {
+        // returns None when user is not found
+        None
+    }
+
+    fn greet_user(id: u64) -> Result<String> {
+        let name = get_username(id)
+            .context("User not found in the session store")?;
+        Ok(format!("Hello, {}!", name))
+    }
+    ```
+  </Tab>
+  <Tab title="with_context and format strings">
+    Use `with_context` with a closure any time the message depends on runtime values. The closure is only called when the operation actually fails.
+
+    ```rust
+    use anyhow::{Context, Result};
+    use std::fs;
+
+    fn process_batch(files: &[&str]) -> Result<()> {
+        for file in files {
+            let contents = fs::read_to_string(file)
+                .with_context(|| format!("Failed to open batch file: {}", file))?;
+
+            println!("Processing {} ({} bytes)", file, contents.len());
+        }
+        Ok(())
+    }
+    ```
+  </Tab>
+</Tabs>
+
+## Effect on Downcasting
+
+Attaching context does **not** obscure the original error type. After calling `.context(...)` or `.with_context(...)`, the resulting `anyhow::Error` can be downcast to either the context type `C` **or** the original error type `E`. This means you can add context to existing code without breaking any existing downcast calls.
+
+<Accordion title="Downcasting through context — both C and E remain accessible">
+
+```rust
+use anyhow::{bail, Context, Result};
+use thiserror::Error;
+
+#[derive(Error, Debug)]
+#[error("suspicious activity detected")]
+struct SuspiciousError;
+
+fn helper() -> Result<()> {
+    bail!(SuspiciousError);
+}
+
+fn do_it() -> Result<()> {
+    helper().context("Failed to complete the work")?;
+    Ok(())
+}
+
+fn main() {
+    let err = do_it().unwrap_err();
+
+    // Downcast to the original error — succeeds even through the context layer
+    if let Some(e) = err.downcast_ref::<SuspiciousError>() {
+        eprintln!("Caught suspicious error: {}", e);
+    }
+
+    // Downcast to the context type — also succeeds
+    if let Some(msg) = err.downcast_ref::<&str>() {
+        eprintln!("Context message: {}", msg);
+    }
+}
+```
+
+</Accordion>
+
+<Tip>
+  Prefer `with_context` over `context` whenever the message involves a `format!` call or any allocation. The closure is zero-cost on the success path and only evaluated when an error actually occurs.
+</Tip>
+
+## `Error::context` vs the `Context` Trait
+
+The `anyhow::Error` struct also exposes a `.context()` method directly (not from the `Context` trait). This method is useful when you have already matched on a `Result` and hold a bare `anyhow::Error` value, especially when the context message needs to be derived from data stored inside the original error.
+
+```rust
+use anyhow::Result;
+use std::fs::File;
+use std::path::Path;
+
+struct ParseError {
+    line: usize,
+    column: usize,
+}
+
+fn parse_impl(file: File) -> Result<(), ParseError> {
+    // ...
+    # unimplemented!()
+}
+
+pub fn parse(path: impl AsRef<Path>) -> Result<()> {
+    let file = File::open(&path)?;
+    parse_impl(file).map_err(|error| {
+        // The context here references fields on the original error,
+        // so we must build it after matching — Error::context is ideal.
+        let context = format!(
+            "only the first {} lines of {} are valid",
+            error.line,
+            path.as_ref().display(),
+        );
+        anyhow::Error::new(error).context(context)
+    })
+}
+```
+
+<Note>
+  The `Context` trait must be imported explicitly: `use anyhow::Context;`. The trait methods are not available on `Result` or `Option` without this import.
+</Note>

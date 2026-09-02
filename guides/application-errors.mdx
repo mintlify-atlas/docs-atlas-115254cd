@@ -1,0 +1,300 @@
+---
+title: "Structuring Application Error Handling with anyhow"
+sidebarTitle: "Application Errors"
+description: "Practical patterns for using anyhow::Result, bail!, ensure!, context chaining, and custom error reporting functions in real Rust application code."
+---
+
+Building robust applications means thinking carefully about how errors flow through your codebase — where they originate, how they get annotated with context, and how they're ultimately surfaced to users or operators. `anyhow` provides a small set of composable primitives that cover all of these needs: a uniform return type, ergonomic propagation with `?`, structured context chaining, and utilities for custom error reporting.
+
+## Using `anyhow::Result<T>` Throughout Your Application
+
+The first step is adopting `anyhow::Result<T>` as the standard return type for every fallible function in your application. `anyhow::Result<T>` is a type alias for `Result<T, anyhow::Error>`, so it integrates naturally with `?`-based propagation for any error that implements `std::error::Error`.
+
+```rust
+use anyhow::Result;
+
+fn get_cluster_info() -> Result<ClusterMap> {
+    let config = std::fs::read_to_string("cluster.json")?;
+    let map: ClusterMap = serde_json::from_str(&config)?;
+    Ok(map)
+}
+```
+
+Because `anyhow::Error` implements `From<E>` for any `E: std::error::Error + Send + Sync + 'static`, you never need to call `.map_err()` just to satisfy the type system. Any standard-library or third-party error type can be propagated with `?` directly.
+
+## Using `fn main() -> anyhow::Result<()>`
+
+Rust's `Termination` trait allows `main` to return a `Result`. When it returns `Err`, the runtime formats the error using its `Debug` representation and exits with a nonzero status code. `anyhow::Error`'s `Debug` output prints the full cause chain in a readable format:
+
+```rust
+use anyhow::{Context, Result};
+
+fn main() -> Result<()> {
+    let path = "./config/cluster.json";
+    let content = std::fs::read(path)
+        .with_context(|| format!("Failed to read config from {}", path))?;
+    println!("Loaded {} bytes", content.len());
+    Ok(())
+}
+```
+
+When the file is missing, the runtime will print:
+
+```console
+Error: Failed to read config from ./config/cluster.json
+
+Caused by:
+    No such file or directory (os error 2)
+```
+
+The `Debug` format includes a backtrace when one is available (requires Rust ≥ 1.65 and `RUST_BACKTRACE=1` or `RUST_LIB_BACKTRACE=1`).
+
+## Mixing anyhow with Library Error Types
+
+The typical architecture for a Rust project is to define typed, structured errors in library crates using [`thiserror`](https://github.com/dtolnay/thiserror), and to use `anyhow` in the application layer for easy propagation and context annotation. Because `anyhow::Error` accepts any `std::error::Error`, the transition between layers is seamless.
+
+```rust
+// In your library crate (using thiserror):
+use thiserror::Error;
+
+#[derive(Error, Debug)]
+pub enum ConfigError {
+    #[error("Missing required field: {0}")]
+    MissingField(String),
+    #[error("Invalid value for {field}: expected {expected}, got {actual}")]
+    InvalidValue {
+        field: String,
+        expected: String,
+        actual: String,
+    },
+}
+```
+
+```rust
+// In your application crate (using anyhow):
+use anyhow::{Context, Result};
+use mylib::ConfigError;
+
+fn load_config(path: &str) -> Result<Config> {
+    let raw = std::fs::read_to_string(path)
+        .with_context(|| format!("Cannot open config file at {}", path))?;
+
+    // ConfigError implements std::error::Error, so ? just works.
+    let config: Config = parse_config(&raw)
+        .context("Config file is malformed")?;
+
+    Ok(config)
+}
+```
+
+The library retains fully typed errors that callers can inspect or match against, while the application adds human-readable context at each layer boundary using `.context()` or `.with_context()`.
+
+## Propagate with `?`, Add Context at Layer Boundaries
+
+A guiding principle when using `anyhow` is: **propagate freely with `?`, but annotate at each abstraction boundary**. A raw OS error like "No such file or directory" is not helpful to a user without knowing what operation triggered it. Wrap errors at the point where you transition from one logical layer to another:
+
+```rust
+use anyhow::{Context, Result};
+
+fn initialize_database(url: &str) -> Result<Database> {
+    let db = connect(url)
+        .with_context(|| format!("Failed to connect to database at {}", url))?;
+
+    db.run_migrations()
+        .context("Failed to run database migrations")?;
+
+    Ok(db)
+}
+```
+
+<Tip>
+Use `.context("static message")` for cheap, pre-known messages. Use `.with_context(|| format!(...))` when building the message requires runtime data — the closure is only evaluated when an error actually occurs.
+</Tip>
+
+## One-off Errors with `anyhow!` and `bail!`
+
+Not every error case deserves its own type. For ad-hoc errors within application logic, the `anyhow!` macro constructs an `anyhow::Error` from a format string:
+
+```rust
+use anyhow::{anyhow, Result};
+
+fn lookup(key: &str) -> Result<Value> {
+    if key.len() != 16 {
+        return Err(anyhow!(
+            "key length must be 16 characters, got {:?}",
+            key
+        ));
+    }
+    // ...
+    # Ok(Value)
+}
+```
+
+The `bail!` macro is shorthand for `return Err(anyhow!(...))` and keeps the control flow more readable:
+
+```rust
+use anyhow::{bail, Result};
+
+fn check_depth(depth: usize, max: usize) -> Result<()> {
+    if depth > max {
+        bail!("recursion depth {} exceeds limit of {}", depth, max);
+    }
+    Ok(())
+}
+```
+
+`bail!` also accepts an existing error value that implements `std::error::Error`:
+
+```rust
+use anyhow::{bail, Result};
+use thiserror::Error;
+
+#[derive(Error, Debug)]
+#[error("recursion limit exceeded")]
+struct RecursionLimitExceeded;
+
+fn recurse(depth: usize) -> Result<()> {
+    if depth > 100 {
+        bail!(RecursionLimitExceeded);
+    }
+    Ok(())
+}
+```
+
+## Guard Conditions with `ensure!`
+
+The `ensure!` macro works like a returning `assert!`: it evaluates a condition and returns an error if it is false. This is useful for validating preconditions at the top of a function without deeply nested `if` blocks:
+
+```rust
+use anyhow::{ensure, Result};
+
+fn process_batch(items: &[Item]) -> Result<Report> {
+    ensure!(!items.is_empty(), "batch must contain at least one item");
+    ensure!(
+        items.len() <= 1000,
+        "batch too large: {} items (limit 1000)",
+        items.len()
+    );
+
+    // proceed knowing preconditions hold
+    Ok(generate_report(items))
+}
+```
+
+Like `bail!`, `ensure!` also accepts a typed error value as its second argument:
+
+```rust
+use anyhow::{ensure, Result};
+
+ensure!(depth <= MAX_DEPTH, ScienceError::RecursionLimitExceeded);
+```
+
+## Iterating the Cause Chain with `error.chain()`
+
+When you need to write a custom error reporter — for example, to format errors as structured logs, send them to a monitoring service, or pretty-print them to a terminal — use `error.chain()` to iterate through all causes in order from outermost to innermost.
+
+`chain()` returns a `Chain` iterator that yields `&dyn std::error::Error` items, starting with the error itself and following each `.source()` link until the root cause:
+
+```rust
+use anyhow::Error;
+
+pub fn underlying_io_error_kind(error: &Error) -> Option<std::io::ErrorKind> {
+    for cause in error.chain() {
+        if let Some(io_error) = cause.downcast_ref::<std::io::Error>() {
+            return Some(io_error.kind());
+        }
+    }
+    None
+}
+```
+
+### Custom Error Reporting Function
+
+Here is a complete example of a custom reporter that prints all causes in the chain to stderr, then exits with a nonzero status code. This pattern is useful when you want more control over the output format than `fn main() -> Result<()>` provides:
+
+```rust
+use anyhow::{Context, Result};
+
+fn main() {
+    if let Err(err) = try_main() {
+        eprintln!("error: {}", err);
+        err.chain()
+            .skip(1)
+            .for_each(|cause| eprintln!("  caused by: {}", cause));
+        std::process::exit(1);
+    }
+}
+
+fn try_main() -> Result<()> {
+    let path = "./data/input.json";
+    let content = std::fs::read_to_string(path)
+        .with_context(|| format!("Failed to read input file at {}", path))?;
+
+    let _parsed: serde_json::Value = serde_json::from_str(&content)
+        .context("Failed to parse input as JSON")?;
+
+    Ok(())
+}
+```
+
+Running this when the file is missing produces:
+
+```console
+error: Failed to read input file at ./data/input.json
+  caused by: No such file or directory (os error 2)
+```
+
+<Note>
+`error.chain().skip(1)` skips the outermost error, which you already printed via `{}`. Each subsequent item in the iterator is a cause from further down the chain.
+</Note>
+
+## Interop: `Error::from_boxed` and `into_boxed_dyn_error`
+
+When integrating `anyhow` with other error-handling libraries or APIs that work in terms of `Box<dyn std::error::Error + Send + Sync + 'static>`, two methods bridge the gap.
+
+**`Error::from_boxed`** constructs an `anyhow::Error` from a pre-existing boxed trait object. This is useful when you receive an error from an interface that already erased the concrete type:
+
+```rust
+use std::error::Error as StdError;
+use anyhow::Error;
+
+fn wrap_external_error(
+    boxed: Box<dyn StdError + Send + Sync + 'static>
+) -> Error {
+    Error::from_boxed(boxed)
+}
+```
+
+**`into_boxed_dyn_error`** is the reverse: it converts an `anyhow::Error` into a `Box<dyn std::error::Error + Send + Sync + 'static>`. The conversion is a cheap pointer cast that does not allocate or copy. Any backtrace captured by `anyhow` remains accessible via the standard library's provider API, though downcasting to the original concrete error type is no longer possible after this conversion.
+
+```rust
+use anyhow::{anyhow, Error};
+
+let err: Error = anyhow!("something went wrong");
+let boxed: Box<dyn std::error::Error + Send + Sync + 'static> = err.into_boxed_dyn_error();
+```
+
+These two methods together make it straightforward to build bidirectional `From` impls between `anyhow::Error` and another library's error abstraction:
+
+```rust
+use std::error::Error as StdError;
+use anyhow::Error;
+
+pub struct Report { /* ... */ }
+
+impl From<Error> for Report {
+    fn from(err: Error) -> Self {
+        let boxed: Box<dyn StdError + Send + Sync + 'static> = err.into_boxed_dyn_error();
+        Report::from_boxed(boxed)
+    }
+}
+
+impl From<Report> for Error {
+    fn from(report: Report) -> Self {
+        let boxed: Box<dyn StdError + Send + Sync + 'static> = report.into_boxed();
+        Error::from_boxed(boxed)
+    }
+}
+```
+
+With these impls in place, functions returning either type can freely use `?` to convert between them.
